@@ -313,6 +313,48 @@
     return rect.width > 0 && rect.height > 0 && getComputedStyle(element).visibility !== "hidden";
   }
 
+  // The app lives on one origin, so anything pointing elsewhere is never a target of ours.
+  // Discord's own header holds a "?" help link to support.discord.com — a different origin
+  // despite the shared domain — rendered as an <a role="button"> with no text, exactly the
+  // shape the invite-button and member-list probes look for. Clicking it throws the tab off
+  // the script's @match, which silently ends the run.
+  function isOffSiteLink(element) {
+    if (!(element instanceof HTMLElement)) return false;
+    const anchor = element.matches("a[href]") ? element : element.closest("a[href]");
+    if (!anchor) return false;
+
+    const href = anchor.getAttribute("href") || "";
+    if (!href || href.startsWith("#")) return false;
+
+    try {
+      // mailto:, discord://, and anything cross-origin all fail this.
+      return new URL(href, location.href).origin !== location.origin;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // Last line of defence behind the per-candidate checks: every click the script makes is
+  // synthetic, so refusing synthetic clicks that would navigate away keeps a mis-targeted
+  // probe on the page. The user's own clicks are trusted and pass straight through.
+  function installOffSiteClickGuard() {
+    document.addEventListener(
+      "click",
+      (event) => {
+        if (event.isTrusted) return;
+        const target = event.target instanceof HTMLElement ? event.target : null;
+        if (!target || !isOffSiteLink(target)) return;
+        if (target.closest("#dic-panel")) return;
+        if (!loadState().running) return;
+
+        event.preventDefault();
+        event.stopPropagation();
+        log("Blocked a click that would have left Discord.");
+      },
+      true,
+    );
+  }
+
   function textMatches(element, needles) {
     const haystack = [
       element.getAttribute("aria-label"),
@@ -335,6 +377,7 @@
       "button, [role='button'], a, [role='link'], input[type='button'], input[type='submit']";
     for (const element of root.querySelectorAll(selectors)) {
       if (!isVisible(element)) continue;
+      if (isOffSiteLink(element)) continue;
       if (textMatches(element, needles)) return element;
     }
     return null;
@@ -1137,6 +1180,8 @@
       if (element.tagName === "INPUT" || element.tagName === "TEXTAREA") continue;
       if (element.tagName === "BUTTON" || element.getAttribute("role") === "button") continue;
       if (!element.querySelector("img")) continue;
+      // A tile wrapped in a link off the app is a promo or a help entry, never a server.
+      if (isOffSiteLink(element)) continue;
 
       const rect = element.getBoundingClientRect();
       if (rect.width < 150 || rect.height < 150 || rect.width > 520 || rect.height > 520) continue;
@@ -1314,6 +1359,7 @@
     for (const button of buttons) {
       if (!(button instanceof HTMLElement)) continue;
       if (!isVisible(button)) continue;
+      if (isOffSiteLink(button)) continue;
       const text = getTextLike(button).replace(/\s+/g, " ").trim().toLowerCase();
       if (text === "go to server" || text.includes("go to server") || text.includes("go to")) {
         return button;
@@ -1368,6 +1414,7 @@
       if (!(element instanceof HTMLElement)) continue;
       if (!isVisible(element)) continue;
       if (element.closest("button, [role='button']")) continue;
+      if (isOffSiteLink(element)) continue;
       const text = getTextLike(element).replace(/\s+/g, " ").trim().toLowerCase();
       if (!text) continue;
 
@@ -1460,6 +1507,8 @@
         if (element.closest('[role="tree"]')) continue;
         if (element.closest('ul[aria-label="Channels"]')) continue;
         if (element.closest('[role="dialog"]')) continue;
+        // The help "?" link sits in this same band and is shaped like a button.
+        if (isOffSiteLink(element)) continue;
 
         const rect = element.getBoundingClientRect();
         if (rect.top < 0 || rect.top > 220) continue;
@@ -1801,6 +1850,7 @@
       if (!(element instanceof HTMLElement)) continue;
       if (!isVisible(element)) continue;
       if (element.closest("#dic-panel")) continue;
+      if (isOffSiteLink(element)) continue;
 
       const label = getTextLike(element).replace(/\s+/g, " ").trim().toLowerCase();
       if (!label) continue;
@@ -2035,6 +2085,8 @@
       if (!isVisible(element)) continue;
       if (element.closest("#dic-panel")) continue;
       if (element.closest('[role="dialog"]')) continue;
+      // The help "?" link sits at the right of this strip, where the sort below looks first.
+      if (isOffSiteLink(element)) continue;
 
       // The toggle lives in the channel header strip along the top of the page.
       const rect = element.getBoundingClientRect();
@@ -3325,6 +3377,7 @@
   }
 
   createUI();
+  installOffSiteClickGuard();
   resumeDiscoverCollectionIfNeeded().catch((err) => {
     logError("Resume failed", err);
   });
