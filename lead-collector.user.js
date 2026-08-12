@@ -655,28 +655,50 @@
     refreshUI();
   }
 
-  // Replace an element's children from an HTML string WITHOUT touching
-  // `innerHTML`.
+  // Trusted Types policy, created once per page load.
   //
   // YouTube serves `Content-Security-Policy: require-trusted-types-for 'script'`,
-  // and `@grant none` means this script runs in the page context where that
-  // applies — so every `innerHTML` assignment throws "This document requires
-  // 'TrustedHTML' assignment". That killed `createUI` before the panel was ever
-  // appended, which is why the panel appeared on Discord (no such header) and
-  // silently never appeared on YouTube.
+  // and `@grant none` runs this script in the PAGE context where that applies.
+  // Under it, assigning a plain string to `innerHTML` throws
+  // "Sink type mismatch violation blocked by CSP" — which is what silently killed
+  // `createUI` on YouTube while Discord (no such header) was unaffected.
   //
-  // `DOMParser.parseFromString` is NOT a Trusted Types sink, so parsing there and
-  // adopting the nodes works on both sites and needs no policy — unlike
-  // `trustedTypes.createPolicy`, which a stricter `trusted-types` allowlist could
-  // still refuse.
+  // `DOMParser.parseFromString` is NOT a way around this: it is itself a Trusted
+  // Types sink and Firefox blocks it the same way. A policy is the actual fix.
+  //
+  // The policy is `createHTML: (s) => s` — an identity transform, which is only
+  // acceptable because every string passed through here is a hardcoded literal in
+  // this file (the panel markup and icon SVGs). No page content, no scraped text
+  // and no user input ever reaches it, so there is nothing to sanitize.
+  //
+  // Creation can still fail on a site whose CSP carries a `trusted-types`
+  // allowlist that excludes this name; YouTube sends no such directive, so any
+  // name is accepted there. On failure we fall back to a plain assignment, which
+  // is correct on every site that does not enforce Trusted Types at all.
+  const TRUSTED_HTML_POLICY = (() => {
+    try {
+      const tt = window.trustedTypes;
+      if (!tt || typeof tt.createPolicy !== "function") return null;
+      return tt.createPolicy("lead-collector", { createHTML: (value) => value });
+    } catch (err) {
+      console.warn("[lead-collector] Trusted Types policy unavailable", err);
+      return null;
+    }
+  })();
+
+  // Replace an element's children from an HTML string, surviving Trusted Types.
+  // Returns whether the markup was actually rendered, so callers can stop instead
+  // of walking a tree that was never built.
   function setHtml(root, html) {
-    if (!root) return;
-    while (root.firstChild) root.removeChild(root.firstChild);
-    const parsed = new DOMParser().parseFromString(`<div id="dic-parse-root">${html}</div>`, "text/html");
-    const source = parsed.getElementById("dic-parse-root");
-    if (!source) return;
-    while (source.firstChild) {
-      root.appendChild(document.adoptNode(source.firstChild));
+    if (!root) return false;
+    try {
+      root.innerHTML = TRUSTED_HTML_POLICY ? TRUSTED_HTML_POLICY.createHTML(html) : html;
+      return true;
+    } catch (err) {
+      // Loud rather than silent: a panel that never appears with nothing useful
+      // in the console is exactly how the YouTube breakage went unnoticed.
+      console.error("[lead-collector] could not render markup", err);
+      return false;
     }
   }
 
@@ -3638,6 +3660,13 @@
       </div>
     `,
     );
+
+    if (!panel.firstChild) {
+      console.error(
+        "[lead-collector] panel markup could not be rendered on this site; aborting setup.",
+      );
+      return;
+    }
 
     document.body.appendChild(panel);
 
