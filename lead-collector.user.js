@@ -96,12 +96,19 @@
   // dropdown shows where this is going without pretending they work — they are
   // rendered disabled and cannot be selected.
   //
+  // The ORDER is prospecting priority, not implementation status, and is
+  // deliberately not "the working one first". SpokPay sells to lojistas moving
+  // Robux for BRL, and that behaviour is advertised most openly on Instagram
+  // (sellers publishing a WhatsApp/PIX contact) and TikTok, with YouTube read
+  // mainly for the business email on the About page. Listing them in the order
+  // they matter commercially is what stops the dropdown from implying YouTube is
+  // the best channel rather than merely the built one — so do not re-sort this by
+  // `available`.
+  //
   // `site` is the SITE value the platform's collector needs, and `host` is what
   // the operator is told to open. Adding a platform later means writing its
   // collector, adding its host to the @match header, and flipping `available`.
   const CREATOR_PLATFORMS = [
-    { value: "youtube", label: "YouTube", site: "youtube", host: "youtube.com", available: true },
-    { value: "tiktok", label: "TikTok", site: "tiktok", host: "tiktok.com", available: false },
     {
       value: "instagram",
       label: "Instagram",
@@ -109,6 +116,8 @@
       host: "instagram.com",
       available: false,
     },
+    { value: "tiktok", label: "TikTok", site: "tiktok", host: "tiktok.com", available: false },
+    { value: "youtube", label: "YouTube", site: "youtube", host: "youtube.com", available: true },
     { value: "twitch", label: "Twitch", site: "twitch", host: "twitch.tv", available: false },
   ];
   const CREATOR_PLATFORM_FALLBACK = CREATOR_PLATFORMS.find((entry) => entry.available);
