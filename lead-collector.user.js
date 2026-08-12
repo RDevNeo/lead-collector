@@ -118,7 +118,6 @@
     },
     { value: "tiktok", label: "TikTok", site: "tiktok", host: "tiktok.com", available: false },
     { value: "youtube", label: "YouTube", site: "youtube", host: "youtube.com", available: true },
-    { value: "twitch", label: "Twitch", site: "twitch", host: "twitch.tv", available: false },
   ];
   const CREATOR_PLATFORM_FALLBACK = CREATOR_PLATFORMS.find((entry) => entry.available);
   const CREATOR_PLATFORM_DEFAULT = CREATOR_PLATFORM_FALLBACK.value;
