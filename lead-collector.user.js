@@ -117,6 +117,55 @@
     (entry) => `${entry.value}${entry.available ? "" : "!"}`,
   ).join("|");
 
+  // Timestamp of a channel's newest upload, from its Atom feed.
+  //
+  // The feed is the only cheap source of an ABSOLUTE date. The /videos tab
+  // carries `publishedTimeText` ("3 days ago", "há 3 dias") — localized to the
+  // operator's session language, which is exactly the class of string this file
+  // refuses to parse anywhere else. The feed answers in ISO 8601 regardless.
+  //
+  // It is also ~21KB against the About page's ~1.3MB, so gating on it BEFORE
+  // enrichment makes a filtered sweep cheaper than an unfiltered one rather than
+  // dearer: a dead channel costs one small read instead of a full page load.
+  //
+  // Read with a regex, like ytInitialData, rather than DOMParser — same reason,
+  // and it keeps the Trusted Types question from arising at all.
+  //
+  // Returns the newest entry's time in ms, or null when the feed holds no
+  // entries (a channel that has never uploaded, or hides its uploads). Throws
+  // when the feed itself cannot be read — 404 for a channel that is gone.
+  async function ytFetchLatestUpload(channelId) {
+    const res = await fetch(
+      `https://www.youtube.com/feeds/videos.xml?channel_id=${encodeURIComponent(channelId)}`,
+      { credentials: "include" },
+    );
+    if (!res.ok) throw new Error(`feed HTTP ${res.status}`);
+    const xml = await res.text();
+
+    // Only entry bodies are considered. The document's FIRST <published> belongs
+    // to the feed itself and is the channel's creation date, so reading dates
+    // document-wide would judge every channel by the day it was made. Entries
+    // are newest-first in practice; taking the max does not rely on that.
+    let newest = 0;
+    for (const chunk of xml.split("<entry>").slice(1)) {
+      const match = chunk.match(/<published>([^<]+)<\/published>/);
+      const time = match ? Date.parse(match[1]) : NaN;
+      if (Number.isFinite(time) && time > newest) newest = time;
+    }
+
+    return newest > 0 ? newest : null;
+  }
+
+  function daysSince(timestamp) {
+    return (Date.now() - timestamp) / 86400000;
+  }
+
+  function formatUploadAge(days) {
+    if (days < 1) return "today";
+    const whole = Math.round(days);
+    return `${whole} day${whole === 1 ? "" : "s"} ago`;
+  }
+
   // Fetch an unfiltered (video) search page, used as the second discovery source.
   async function ytFetchVideoSearch(query) {
     const url = `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`;
@@ -182,22 +231,32 @@
     return found;
   }
 
-  // Run one creator sweep. Discovers from BOTH search sources, then reads each
-  // new channel's About page. Runs until the target is met, both sources are
-  // exhausted, or the operator stops.
+  // Run one creator sweep. Discovers from BOTH search sources, drops every
+  // channel that has not uploaded recently, then reads each survivor's About
+  // page. Runs until the target is met, both sources are exhausted, or the
+  // operator stops.
   async function collectCreators(query) {
     const capturedAt = new Date().toISOString();
     const known = new Set((loadState().creators || []).map((row) => row.platform_id));
     const platform = getCreatorPlatform();
     const target = getTargetCount("creators");
-    // Over-discover a little: some channels fail their About fetch, and coming up
-    // short of the target because of that would be worse than a few extra reads.
-    const wanted = target > 0 ? Math.max(target - currentCollectedCount("creators"), 0) + 5 : 0;
+    const gapDays = getUploadGapDays();
+    // Over-discover: some channels fail their About fetch and, when the
+    // freshness gate is on, many more are dropped as dead. Coming up short of
+    // the target because of that would be worse than a few extra reads.
+    const remaining = Math.max(target - currentCollectedCount("creators"), 0);
+    const wanted =
+      target > 0 ? Math.ceil(remaining / (gapDays > 0 ? YT_LIVE_RATE_ESTIMATE : 1)) + 5 : 0;
 
     log(
       target > 0
         ? `Sweeping ${platform.label} for "${query}" - target ${target} creator(s).`
         : `Sweeping ${platform.label} for "${query}" - no target, collecting everything.`,
+    );
+    log(
+      gapDays > 0
+        ? `Dropping any channel with no upload in the last ${gapDays} days.`
+        : "No freshness filter - collecting channels whenever they last uploaded.",
     );
 
     let discovered = [];
@@ -232,13 +291,59 @@
       return;
     }
 
-    log(`Reading ${discovered.length} channel page(s) for links and stats...`);
+    log(
+      gapDays > 0
+        ? `Checking uploads on ${discovered.length} channel(s), then reading the live ones...`
+        : `Reading ${discovered.length} channel page(s) for links and stats...`,
+    );
+    let dropped = 0;
+
     for (const entry of discovered) {
       if (stopRequested) break;
       if (targetReached("creators")) {
         log(`Target of ${target} creator(s) reached.`);
         break;
       }
+
+      const label = entry.name || entry.channelId;
+
+      // Freshness gate, ahead of enrichment so a dead channel never costs an
+      // About page. An unreadable feed is treated as a drop, not a pass: the
+      // whole point is that nothing unverified gets through, and the log says
+      // which of the two it was. Skipped entirely on "Any time", which also
+      // spares every channel the extra request.
+      let uploadAgeDays = null;
+      if (gapDays > 0) {
+        let latestUpload;
+        try {
+          latestUpload = await ytFetchLatestUpload(entry.channelId);
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          dropped += 1;
+          log(`DROP ${label}: could not check uploads (${message}).`);
+          await sleep(YT_FEED_DELAY_MS);
+          continue;
+        }
+
+        if (latestUpload === null) {
+          dropped += 1;
+          log(`DROP ${label}: no uploads at all.`);
+          await sleep(YT_FEED_DELAY_MS);
+          continue;
+        }
+
+        uploadAgeDays = daysSince(latestUpload);
+        if (uploadAgeDays > gapDays) {
+          dropped += 1;
+          log(
+            `DROP ${label}: dead - last upload ${formatUploadAge(uploadAgeDays)} ` +
+              `(limit ${gapDays} days).`,
+          );
+          await sleep(YT_FEED_DELAY_MS);
+          continue;
+        }
+      }
+
       try {
         const detail = await ytEnrichChannel(entry.channelId);
         const record = {
@@ -261,14 +366,20 @@
         state.creators = (state.creators || []).concat([record]);
         saveState(state);
         const subs = record.subscriber_count === null ? "hidden" : record.subscriber_count;
-        log(`OK ${record.name} - ${subs} subs, ${record.links.length} link(s)`);
+        const freshness =
+          uploadAgeDays === null ? "" : `, last upload ${formatUploadAge(uploadAgeDays)}`;
+        log(`OK ${record.name} - ${subs} subs, ${record.links.length} link(s)${freshness}`);
       } catch (err) {
         // One unreadable channel must never abort the sweep.
         const message = err instanceof Error ? err.message : String(err);
-        log(`SKIP ${entry.name || entry.channelId}: ${message}`);
+        log(`SKIP ${label}: ${message}`);
       }
       refreshUI();
       await sleep(YT_ENRICH_DELAY_MS);
+    }
+
+    if (dropped > 0) {
+      log(`Dropped ${dropped} dead channel(s) - no upload in the last ${gapDays} days.`);
     }
   }
 
@@ -308,6 +419,27 @@
 
   const YT_ENRICH_DELAY_MS = 350;
   const YT_PAGE_DELAY_MS = 250;
+
+  // Freshness gate: a channel whose newest upload is older than the chosen
+  // window is dropped before it is ever enriched. An abandoned channel is not a
+  // lead, and the check is cheap enough to run on everything (see
+  // ytFetchLatestUpload). 0 turns the gate off entirely.
+  const YT_UPLOAD_GAP_CHOICES = [
+    { value: 7, label: "Last 7 days" },
+    { value: 14, label: "Last 14 days" },
+    { value: 30, label: "Last 30 days" },
+    { value: 90, label: "Last 90 days" },
+    { value: 0, label: "Any time" },
+  ];
+  const YT_UPLOAD_GAP_DEFAULT_DAYS = 14;
+  const YT_UPLOAD_GAP_SIGNATURE = YT_UPLOAD_GAP_CHOICES.map((entry) => entry.value).join("|");
+  const YT_FEED_DELAY_MS = 150;
+
+  // Rough share of discovered channels expected to clear the gate, used ONLY to
+  // decide how many to discover. Dropped channels do not count toward the
+  // target, so without this cushion a target of 100 would page just past 100
+  // channels, drop the dead ones and finish short.
+  const YT_LIVE_RATE_ESTIMATE = 0.6;
 
   // Depth-first search for the first object carrying `key`. Used instead of
   // fixed paths into `ytInitialData`: YouTube reshuffles renderer nesting often,
@@ -773,6 +905,7 @@
       activeTab: SITE === "youtube" ? "creators" : "servers",
       creatorQuery: "",
       creatorPlatform: CREATOR_PLATFORM_DEFAULT,
+      creatorUploadGapDays: YT_UPLOAD_GAP_DEFAULT_DAYS,
       creators: [],
       // Stop-at count, kept PER TAB: the Servers walk stops at N invites and the
       // Creators sweep stops at N creator records, and each tab remembers its own
@@ -897,6 +1030,24 @@
     const stored = String(loadState().creatorPlatform || "");
     const match = CREATOR_PLATFORMS.find((entry) => entry.value === stored);
     return match && match.available ? match : CREATOR_PLATFORM_FALLBACK;
+  }
+
+  // Freshness window in days, or 0 for "collect regardless of last upload".
+  // Anything not on the menu falls back to the default rather than becoming a
+  // window nobody can see in the dropdown.
+  function getUploadGapDays() {
+    const stored = Number(loadState().creatorUploadGapDays);
+    const match = YT_UPLOAD_GAP_CHOICES.find((entry) => entry.value === stored);
+    return match ? match.value : YT_UPLOAD_GAP_DEFAULT_DAYS;
+  }
+
+  function setUploadGapDays(value) {
+    const parsed = Number(value);
+    const match = YT_UPLOAD_GAP_CHOICES.find((entry) => entry.value === parsed);
+    const state = loadState();
+    state.creatorUploadGapDays = match ? match.value : YT_UPLOAD_GAP_DEFAULT_DAYS;
+    saveState(state);
+    refreshUI();
   }
 
   function setCreatorPlatform(value) {
@@ -3187,6 +3338,26 @@
     select.disabled = Boolean(running);
   }
 
+  // Static list, so built once and only the value written afterwards — same
+  // reason as the platform dropdown: rebuilding on every refreshUI would close
+  // it under the operator.
+  function renderUploadGapOptions(select, running) {
+    if (select.dataset.dicSignature !== YT_UPLOAD_GAP_SIGNATURE) {
+      select.dataset.dicSignature = YT_UPLOAD_GAP_SIGNATURE;
+      clearChildren(select);
+
+      for (const choice of YT_UPLOAD_GAP_CHOICES) {
+        const option = document.createElement("option");
+        option.value = String(choice.value);
+        option.textContent = choice.label;
+        select.appendChild(option);
+      }
+    }
+
+    select.value = String(getUploadGapDays());
+    select.disabled = Boolean(running);
+  }
+
   function renderDiscoverLanguageOptions(select, running) {
     const selected = getDiscoverLanguage();
     const choices = getDiscoverLanguageChoices();
@@ -3275,6 +3446,14 @@
     const creatorSourceSelect = document.getElementById("dic-creator-source");
     if (creatorSourceRow) creatorSourceRow.style.display = tab === "creators" ? "" : "none";
     if (creatorSourceSelect) renderCreatorPlatformOptions(creatorSourceSelect, state.running);
+    // The freshness window only means anything for a sweep that can run, so it
+    // follows the Search box rather than the always-visible Source row.
+    const uploadGapRow = document.getElementById("dic-upload-gap-row");
+    const uploadGapSelect = document.getElementById("dic-upload-gap");
+    if (uploadGapRow) {
+      uploadGapRow.style.display = tab === "creators" && tabRunnable ? "" : "none";
+    }
+    if (uploadGapSelect) renderUploadGapOptions(uploadGapSelect, state.running);
     const targetRow = document.getElementById("dic-target-row");
     const targetControl = document.getElementById("dic-target-control");
     const targetInput = document.getElementById("dic-target");
@@ -3673,6 +3852,7 @@
         #dic-target-row,
         #dic-creator-row,
         #dic-creator-source-row,
+        #dic-upload-gap-row,
         #dic-mode-row,
         #dic-discover-row,
         #dic-discover-language-row {
@@ -3681,6 +3861,7 @@
         #dic-target-label,
         #dic-creator-label,
         #dic-creator-source-label,
+        #dic-upload-gap-label,
         #dic-mode-label,
         #dic-discover-label,
         #dic-discover-language-label {
@@ -3692,6 +3873,7 @@
         }
         #dic-mode,
         #dic-creator-source,
+        #dic-upload-gap,
         #dic-discover-language,
         #dic-creator-query,
         #dic-discover-query {
@@ -3708,6 +3890,7 @@
         }
         #dic-mode:focus,
         #dic-creator-source:focus,
+        #dic-upload-gap:focus,
         #dic-discover-language:focus,
         #dic-creator-query:focus,
         #dic-discover-query:focus {
@@ -3715,6 +3898,7 @@
           box-shadow: 0 0 0 3px color-mix(in oklab, var(--dic-ring) 25%, transparent);
         }
         #dic-creator-source:disabled,
+        #dic-upload-gap:disabled,
         #dic-creator-query:disabled {
           opacity: .5;
           cursor: default;
@@ -4058,6 +4242,10 @@
           <label id="dic-creator-source-label" for="dic-creator-source">Source</label>
           <select id="dic-creator-source"></select>
         </div>
+        <div id="dic-upload-gap-row" style="display:none">
+          <label id="dic-upload-gap-label" for="dic-upload-gap">Last upload</label>
+          <select id="dic-upload-gap"></select>
+        </div>
         <div id="dic-creator-row" style="display:none">
           <label id="dic-creator-label" for="dic-creator-query">Search</label>
           <input id="dic-creator-query" type="text" placeholder="ex: roblox blox fruits" autocomplete="off" spellcheck="false" />
@@ -4185,6 +4373,8 @@
     panel.querySelector("#dic-target-down").onclick = () => stepTarget(-TARGET_STEP);
     const creatorSourceSelect = panel.querySelector("#dic-creator-source");
     creatorSourceSelect.onchange = () => setCreatorPlatform(creatorSourceSelect.value);
+    const uploadGapSelect = panel.querySelector("#dic-upload-gap");
+    uploadGapSelect.onchange = () => setUploadGapDays(uploadGapSelect.value);
     const creatorInput = panel.querySelector("#dic-creator-query");
     creatorInput.oninput = () => setCreatorQuery(creatorInput.value);
     creatorInput.onkeydown = (e) => {

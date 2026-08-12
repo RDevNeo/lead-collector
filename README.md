@@ -41,7 +41,8 @@ cap the next server scan. Leave it blank to collect everything the source gives;
 **Source** picks the platform to sweep. YouTube is the only one with a collector today; the rest are
 listed as *soon* and cannot be selected. Type a search term (e.g. `roblox blox fruits`) and press
 Start. The sweep reads YouTube's
-channel-filtered search results, then opens each channel's About data for its stats and profile links.
+channel-filtered search results, drops every channel that has not uploaded recently, then opens each
+survivor's About data for its stats and profile links.
 **Copy** puts the batch on your clipboard as JSONL — one complete JSON record per line — which is what
 **SpokPayCRM → Creators → Import** expects. You paste it there yourself; nothing is imported
 automatically.
@@ -54,6 +55,24 @@ automatically.
 | `description`, `country` | From About |
 | `links` | Profile links, with YouTube's `/redirect?q=` wrapper unwrapped |
 | `discovered_via`, `captured_at` | Which search found them, and when |
+
+### Dead channels are dropped
+
+**Last upload** sets the freshness window — 7, 14 (default), 30 or 90 days, or *Any time* to turn the
+filter off. A channel that has not uploaded inside the window never reaches your clipboard. The check
+reads the channel's Atom feed (`/feeds/videos.xml?channel_id=…`), which answers with absolute ISO dates —
+unlike the `/videos` tab, whose "3 days ago" is localized to whatever language the session is in.
+Shorts count as uploads; they appear in the feed like any other video.
+
+The gate runs **before** enrichment, and the feed is ~21KB against the About page's ~1.3MB, so
+filtering makes a sweep cheaper rather than dearer. Every drop is named in the log with its reason —
+`DROP <name>: dead - last upload 41 days ago (limit 14 days)` — and a channel whose feed cannot be
+read at all is dropped too, logged as `could not check uploads`, since letting it through would
+defeat the point. Kept channels record their freshness on the `OK` line. Because drops do not count
+toward the Target, the sweep discovers past it to compensate.
+
+On *Any time* the gate is skipped entirely — no feed request per channel, and the sweep behaves as it
+did before the filter existed.
 
 The profile links matter most: that is where a creator's Instagram, TikTok and Discord live. The CRM
 flags a creator whose links include a `discord.gg` invite, since someone already running a server is a
