@@ -174,16 +174,6 @@
     return `${whole} day${whole === 1 ? "" : "s"} ago`;
   }
 
-  // Fetch an unfiltered (video) search page, used as the second discovery source.
-  async function ytFetchVideoSearch(query) {
-    const url = `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`;
-    const res = await fetch(url, { credentials: "include" });
-    if (!res.ok) throw new Error(`video search HTTP ${res.status}`);
-    const data = ytExtractInitialData(await res.text());
-    if (!data) throw new Error("could not read YouTube search data");
-    return data;
-  }
-
   // Page through one search source, collecting channels until it runs dry, the
   // target is met, or the operator stops. Returns everything new it found.
   //
@@ -239,22 +229,41 @@
     return found;
   }
 
-  // Run one creator sweep. Discovers from BOTH search sources, drops every
-  // channel that has not uploaded recently, then reads each survivor's About
-  // page. Runs until the target is met, both sources are exhausted, or the
-  // operator stops.
+  // How many channels to DISCOVER for the leads still missing.
+  //
+  // A discovered channel that fails the freshness gate yields nothing, so asking
+  // for exactly the shortfall guarantees finishing short. The divisor is the
+  // keep rate actually OBSERVED this sweep once there is enough of it to mean
+  // anything, falling back to the estimate before that, and floored so a brutal
+  // early run of dead channels cannot demand a five-figure page-through.
+  function discoveryAppetite(target, stats) {
+    if (target <= 0) return 0;
+    const shortfall = Math.max(target - currentCollectedCount("creators"), 0);
+    if (shortfall === 0) return 0;
+    const rate =
+      stats.considered >= 10
+        ? Math.max(stats.kept / stats.considered, YT_MIN_LIVE_RATE)
+        : YT_LIVE_RATE_ESTIMATE;
+    return Math.ceil(shortfall / rate) + 5;
+  }
+
+  // Run one creator sweep.
+  //
+  // Discovery walks a LIST of search surfaces (YT_DISCOVERY_PASSES), harvesting
+  // after each one and stopping the moment the target is met. Harvesting between
+  // passes rather than after all of them is what makes the target reachable: the
+  // shortfall is only knowable once the dead channels have been dropped, so each
+  // pass sizes its appetite from what the previous ones actually yielded.
+  //
+  // Ends when the target is met, every surface is exhausted, or the operator
+  // stops — and says which.
   async function collectCreators(query) {
     const capturedAt = new Date().toISOString();
     const known = new Set((loadState().creators || []).map((row) => row.platform_id));
     const platform = getCreatorPlatform();
     const target = getTargetCount("creators");
     const gapDays = getUploadGapDays();
-    // Over-discover: some channels fail their About fetch and, when the
-    // freshness gate is on, many more are dropped as dead. Coming up short of
-    // the target because of that would be worse than a few extra reads.
-    const remaining = Math.max(target - currentCollectedCount("creators"), 0);
-    const wanted =
-      target > 0 ? Math.ceil(remaining / (gapDays > 0 ? YT_LIVE_RATE_ESTIMATE : 1)) + 5 : 0;
+    const stats = { considered: 0, kept: 0, dropped: 0, discovered: 0 };
 
     log(
       target > 0
@@ -267,53 +276,82 @@
         : "No freshness filter - collecting channels whenever they last uploaded.",
     );
 
-    let discovered = [];
+    for (const pass of YT_DISCOVERY_PASSES) {
+      if (stopRequested) break;
+      if (target > 0 && targetReached("creators")) break;
 
-    // Source 1: the channel filter. Highest-quality hits (real channel records
-    // with subscriber counts), so it goes first.
-    try {
-      const channelPage = await ytFetchSearch(query);
-      discovered = discovered.concat(
-        await ytPageThrough("Channels", channelPage, ytChannelsFromSearch, known, wanted),
-      );
-    } catch (err) {
-      log(`Channel search failed: ${err instanceof Error ? err.message : String(err)}`);
-    }
-
-    // Source 2: video search uploaders. Only if there is still appetite — this is
-    // the deeper vein and is what carries a sweep past the channel filter's end.
-    const stillWanted = wanted > 0 ? wanted - discovered.length : 0;
-    if (!stopRequested && (wanted === 0 || stillWanted > 0)) {
+      let page;
       try {
-        const videoPage = await ytFetchVideoSearch(query);
-        discovered = discovered.concat(
-          await ytPageThrough("Videos", videoPage, ytUploadersFromSearch, known, stillWanted),
-        );
+        page = await ytFetchSearch(query, pass.sp);
       } catch (err) {
-        log(`Video search failed: ${err instanceof Error ? err.message : String(err)}`);
+        log(`${pass.label} search failed: ${err instanceof Error ? err.message : String(err)}`);
+        continue;
+      }
+
+      const discovered = await ytPageThrough(
+        pass.label,
+        page,
+        pass.extract,
+        known,
+        discoveryAppetite(target, stats),
+      );
+      stats.discovered += discovered.length;
+
+      if (discovered.length === 0) {
+        log(`${pass.label}: nothing new.`);
+        continue;
+      }
+
+      await harvestChannels(discovered, {
+        query,
+        capturedAt,
+        platform,
+        target,
+        gapDays,
+        stats,
+      });
+
+      if (!stopRequested && (target === 0 || !targetReached("creators"))) {
+        await sleep(YT_PASS_DELAY_MS);
       }
     }
 
-    if (discovered.length === 0) {
-      log("Nothing new found for that term.");
-      return;
+    if (stats.dropped > 0) {
+      log(`Dropped ${stats.dropped} dead channel(s) - no upload in the last ${gapDays} days.`);
     }
+    if (stats.discovered === 0) {
+      log("Nothing new found for that term.");
+    } else if (target > 0 && !targetReached("creators") && !stopRequested) {
+      // Say it plainly rather than letting a short finish look like a full one:
+      // every surface has been read, so the shortfall is the term's, not a bug.
+      log(
+        `Every search surface is exhausted for "${query}" and the target is still ` +
+          `${Math.max(target - currentCollectedCount("creators"), 0)} short. ` +
+          "Try another search term, or widen Last upload.",
+      );
+    }
+  }
+
+  // Gate, enrich and store one batch of discovered channels. Stops early the
+  // moment the target is met so a late pass never overshoots it.
+  async function harvestChannels(entries, ctx) {
+    const { query, capturedAt, platform, target, gapDays, stats } = ctx;
 
     log(
       gapDays > 0
-        ? `Checking uploads on ${discovered.length} channel(s), then reading the live ones...`
-        : `Reading ${discovered.length} channel page(s) for links and stats...`,
+        ? `Checking uploads on ${entries.length} channel(s), then reading the live ones...`
+        : `Reading ${entries.length} channel page(s) for links and stats...`,
     );
-    let dropped = 0;
 
-    for (const entry of discovered) {
+    for (const entry of entries) {
       if (stopRequested) break;
-      if (targetReached("creators")) {
+      if (target > 0 && targetReached("creators")) {
         log(`Target of ${target} creator(s) reached.`);
         break;
       }
 
       const label = entry.name || entry.channelId;
+      stats.considered += 1;
 
       // Freshness gate, ahead of enrichment so a dead channel never costs an
       // About page. An unreadable feed is treated as a drop, not a pass: the
@@ -327,14 +365,14 @@
           latestUpload = await ytFetchLatestUpload(entry.channelId);
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
-          dropped += 1;
+          stats.dropped += 1;
           log(`DROP ${label}: could not check uploads (${message}).`);
           await sleep(YT_FEED_DELAY_MS);
           continue;
         }
 
         if (latestUpload === null) {
-          dropped += 1;
+          stats.dropped += 1;
           log(`DROP ${label}: no uploads at all.`);
           await sleep(YT_FEED_DELAY_MS);
           continue;
@@ -342,7 +380,7 @@
 
         uploadAgeDays = daysSince(latestUpload);
         if (uploadAgeDays > gapDays) {
-          dropped += 1;
+          stats.dropped += 1;
           log(
             `DROP ${label}: dead - last upload ${formatUploadAge(uploadAgeDays)} ` +
               `(limit ${gapDays} days).`,
@@ -373,6 +411,7 @@
         const state = loadState();
         state.creators = (state.creators || []).concat([record]);
         saveState(state);
+        stats.kept += 1;
         const subs = record.subscriber_count === null ? "hidden" : record.subscriber_count;
         const freshness =
           uploadAgeDays === null ? "" : `, last upload ${formatUploadAge(uploadAgeDays)}`;
@@ -384,10 +423,6 @@
       }
       refreshUI();
       await sleep(YT_ENRICH_DELAY_MS);
-    }
-
-    if (dropped > 0) {
-      log(`Dropped ${dropped} dead channel(s) - no upload in the last ${gapDays} days.`);
     }
   }
 
@@ -404,10 +439,91 @@
   // own session. No API key, no external service — the script stays secret-free
   // and the CRM is still fed by copy-paste.
 
-  // YouTube encodes result-type filters in the `sp` query param; this is the
-  // documented "Channel" value, so the sweep reads channel records directly
-  // instead of inferring uploaders from video results.
-  const YT_CHANNEL_FILTER = "EgIQAg%3D%3D";
+  // YouTube encodes search filters in a protobuf message carried, base64'd, in
+  // the `sp` query param. Only two fields matter here:
+  //
+  //   field 1 (varint)  sort order
+  //   field 2 (message) filters — field 1 = upload date, field 2 = result type
+  //
+  // Built literally rather than through a protobuf library: the script has no
+  // build step and no dependencies, and these are four bytes. Sanity check —
+  // `{type: CHANNEL}` encodes to `EgIQAg%3D%3D`, the hardcoded channel filter
+  // this replaced.
+  const YT_SORT = { RELEVANCE: 0, DATE: 1, RATING: 2, VIEWS: 3 };
+  const YT_UPLOADED = { TODAY: 1, WEEK: 3, MONTH: 4 };
+  const YT_TYPE = { VIDEO: 1, CHANNEL: 2 };
+
+  function ytSearchParam({ sort, uploaded, type } = {}) {
+    const bytes = [];
+    if (sort) bytes.push(0x08, sort);
+    const filters = [];
+    if (uploaded) filters.push(0x08, uploaded);
+    if (type) filters.push(0x10, type);
+    if (filters.length) bytes.push(0x12, filters.length, ...filters);
+    return encodeURIComponent(btoa(String.fromCharCode(...bytes)));
+  }
+
+  // Discovery passes, run in order until the target is met.
+  //
+  // ONE search surface is a shallow vein: measured on "blox fruits brasil", the
+  // channel filter and plain video search together run dry at ~60 channels, so a
+  // target of 50 finished at 34 once the dead ones were dropped. The fix is more
+  // surfaces, not deeper paging — each of these RANKS DIFFERENTLY and therefore
+  // returns a materially different set. Measured against live search, page 1 of
+  // each, counting channels the default channel filter never showed:
+  //
+  //   channels by view count   +20 of 20    videos by view count   +12 of 13
+  //   videos uploaded today    +19 of 20    videos by upload date  +11 of 13
+  //   videos this month        +11 of 15    videos (relevance)     +10 of 13
+  //   videos this week          +9 of 13    channels by rating      +3 of 20
+  //   channels by upload date   +0 of 20  ← identical to relevance; not listed
+  //
+  // The date-filtered video passes are first among the video sources on purpose:
+  // an uploader found under "today" or "this week" has, by definition, just
+  // uploaded, so it survives the freshness gate that discards most of the rest.
+  const YT_DISCOVERY_PASSES = [
+    { label: "Channels", sp: { type: YT_TYPE.CHANNEL }, extract: ytChannelsFromSearch },
+    {
+      label: "Channels by views",
+      sp: { sort: YT_SORT.VIEWS, type: YT_TYPE.CHANNEL },
+      extract: ytChannelsFromSearch,
+    },
+    {
+      label: "Videos today",
+      sp: { uploaded: YT_UPLOADED.TODAY, type: YT_TYPE.VIDEO },
+      extract: ytUploadersFromSearch,
+    },
+    {
+      label: "Videos this week",
+      sp: { uploaded: YT_UPLOADED.WEEK, type: YT_TYPE.VIDEO },
+      extract: ytUploadersFromSearch,
+    },
+    { label: "Videos", sp: { type: YT_TYPE.VIDEO }, extract: ytUploadersFromSearch },
+    {
+      label: "Videos this month",
+      sp: { uploaded: YT_UPLOADED.MONTH, type: YT_TYPE.VIDEO },
+      extract: ytUploadersFromSearch,
+    },
+    {
+      label: "Videos by views",
+      sp: { sort: YT_SORT.VIEWS, type: YT_TYPE.VIDEO },
+      extract: ytUploadersFromSearch,
+    },
+    {
+      label: "Videos by upload date",
+      sp: { sort: YT_SORT.DATE, type: YT_TYPE.VIDEO },
+      extract: ytUploadersFromSearch,
+    },
+    {
+      label: "Channels by rating",
+      sp: { sort: YT_SORT.RATING, type: YT_TYPE.CHANNEL },
+      extract: ytChannelsFromSearch,
+    },
+  ];
+
+  // Breather between passes. Each pass is a fresh search request, and running
+  // nine of them back to back is exactly the shape that gets a client throttled.
+  const YT_PASS_DELAY_MS = 600;
 
   // Safety stop only. There is no page budget any more: YouTube hands out
   // continuation tokens well past the point it stops returning channels, so a
@@ -443,11 +559,14 @@
   const YT_UPLOAD_GAP_SIGNATURE = YT_UPLOAD_GAP_CHOICES.map((entry) => entry.value).join("|");
   const YT_FEED_DELAY_MS = 150;
 
-  // Rough share of discovered channels expected to clear the gate, used ONLY to
-  // decide how many to discover. Dropped channels do not count toward the
-  // target, so without this cushion a target of 100 would page just past 100
-  // channels, drop the dead ones and finish short.
+  // Opening guess at the share of discovered channels that will clear the gate,
+  // used ONLY to size discovery. Dropped channels do not count toward the target,
+  // so without a cushion a target of 100 would page just past 100 channels, drop
+  // the dead ones and finish short. Once a sweep has seen enough channels to
+  // measure its own keep rate, the measurement replaces this — the floor keeps a
+  // rough patch from turning the appetite into a five-figure page-through.
   const YT_LIVE_RATE_ESTIMATE = 0.6;
+  const YT_MIN_LIVE_RATE = 0.15;
 
   // Depth-first search for the first object carrying `key`. Used instead of
   // fixed paths into `ytInitialData`: YouTube reshuffles renderer nesting often,
@@ -595,10 +714,13 @@
     }
   }
 
-  async function ytFetchSearch(query) {
-    const url = `https://www.youtube.com/results?search_query=${encodeURIComponent(
-      query,
-    )}&sp=${YT_CHANNEL_FILTER}`;
+  // One search page for a discovery pass. `filters` is the pass's `sp` spec (see
+  // ytSearchParam); omitting it searches unfiltered.
+  async function ytFetchSearch(query, filters) {
+    const sp = ytSearchParam(filters);
+    const url = `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}${
+      sp ? `&sp=${sp}` : ""
+    }`;
     const res = await fetch(url, { credentials: "include" });
     if (!res.ok) throw new Error(`search HTTP ${res.status}`);
     const data = ytExtractInitialData(await res.text());

@@ -40,8 +40,8 @@ cap the next server scan. Leave it blank to collect everything the source gives;
 
 **Source** picks the platform to sweep. YouTube is the only one with a collector today; the rest are
 listed as *soon* and cannot be selected. Type a search term (e.g. `roblox blox fruits`) and press
-Start. The sweep reads YouTube's
-channel-filtered search results, drops every channel that has not uploaded recently, then opens each
+Start. The sweep searches YouTube
+across several surfaces, drops every channel that has not uploaded recently, then opens each
 survivor's About data for its stats and profile links.
 **Copy** puts the batch on your clipboard as JSONL — one complete JSON record per line — which is what
 **SpokPayCRM → Creators → Import** expects. You paste it there yourself; nothing is imported
@@ -73,6 +73,23 @@ toward the Target, the sweep discovers past it to compensate.
 
 On *Any time* the gate is skipped entirely — no feed request per channel, and the sweep behaves as it
 did before the filter existed.
+
+### Reaching the Target
+
+One search surface is a shallow vein. The channel filter plus plain video search run dry at ~60
+channels for a given term, so a target of 50 used to finish at 34 once the dead ones were dropped.
+
+Discovery therefore walks a **list of surfaces** — channel results by relevance and by view count,
+video results filtered to today / this week / this month, video results by view count and by upload
+date, channel results by rating — harvesting after each and stopping the moment the target is met.
+They rank differently, so they return materially different sets: measured on page 1 alone, *channels
+by view count* was 20-for-20 channels the default filter never showed. The date-filtered video passes
+run early on purpose: an uploader found under *today* has by definition just uploaded, so it survives
+the freshness gate that discards most of the rest.
+
+Each pass sizes itself from the keep rate the sweep has actually observed, so a term full of dead
+channels asks for proportionally more. When every surface is exhausted and the target is still not
+met, the log says so plainly instead of letting a short finish look like a complete one.
 
 The profile links matter most: that is where a creator's Instagram, TikTok and Discord live. The CRM
 flags a creator whose links include a `discord.gg` invite, since someone already running a server is a
