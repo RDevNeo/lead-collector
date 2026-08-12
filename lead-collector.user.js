@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lead Collector
 // @namespace    https://github.com/RDevNeo/lead-collector
-// @version      1.10.21
+// @version      1.10.22
 // @description  Collect Discord server invites, and YouTube creator profiles, into SpokPayCRM.
 // @author       RDevNeo
 // @license      MIT
@@ -79,7 +79,7 @@
   // up after this many failures and keep scanning with whatever Discover is showing.
   const DISCOVER_LANGUAGE_FAILURE_LIMIT = 3;
 
-  const SCRIPT_VERSION = "1.10.21";
+  const SCRIPT_VERSION = "1.10.22";
 
   // ===========================================================================
   // Site detection
