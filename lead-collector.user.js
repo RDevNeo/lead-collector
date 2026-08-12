@@ -655,9 +655,39 @@
     refreshUI();
   }
 
+  // Replace an element's children from an HTML string WITHOUT touching
+  // `innerHTML`.
+  //
+  // YouTube serves `Content-Security-Policy: require-trusted-types-for 'script'`,
+  // and `@grant none` means this script runs in the page context where that
+  // applies — so every `innerHTML` assignment throws "This document requires
+  // 'TrustedHTML' assignment". That killed `createUI` before the panel was ever
+  // appended, which is why the panel appeared on Discord (no such header) and
+  // silently never appeared on YouTube.
+  //
+  // `DOMParser.parseFromString` is NOT a Trusted Types sink, so parsing there and
+  // adopting the nodes works on both sites and needs no policy — unlike
+  // `trustedTypes.createPolicy`, which a stricter `trusted-types` allowlist could
+  // still refuse.
+  function setHtml(root, html) {
+    if (!root) return;
+    while (root.firstChild) root.removeChild(root.firstChild);
+    const parsed = new DOMParser().parseFromString(`<div id="dic-parse-root">${html}</div>`, "text/html");
+    const source = parsed.getElementById("dic-parse-root");
+    if (!source) return;
+    while (source.firstChild) {
+      root.appendChild(document.adoptNode(source.firstChild));
+    }
+  }
+
+  function clearChildren(node) {
+    if (!node) return;
+    while (node.firstChild) node.removeChild(node.firstChild);
+  }
+
   function setIconButtonContent(button, label, iconMarkup) {
     if (!button) return;
-    button.innerHTML = `${iconMarkup}<span class="dic-sr-only">${label}</span>`;
+    setHtml(button, `${iconMarkup}<span class="dic-sr-only">${label}</span>`);
     button.setAttribute("aria-label", label);
     button.title = label;
     button.type = "button";
@@ -2856,7 +2886,7 @@
     // and refreshUI runs often, so only touch the DOM when the list actually changed.
     if (select.dataset.dicSignature !== signature) {
       select.dataset.dicSignature = signature;
-      select.innerHTML = "";
+      clearChildren(select);
 
       const any = document.createElement("option");
       any.value = DISCOVER_LANGUAGE_ANY;
@@ -3116,7 +3146,9 @@
 
     const panel = document.createElement("div");
     panel.id = "dic-panel";
-    panel.innerHTML = `
+    setHtml(
+      panel,
+      `
       <style>
         /* Panel-scoped design tokens. Everything is namespaced under #dic-panel and
            --dic-*, so nothing here can leak into Discord's own styles. */
@@ -3604,7 +3636,8 @@
           <div id="dic-log"></div>
         </div>
       </div>
-    `;
+    `,
+    );
 
     document.body.appendChild(panel);
 
