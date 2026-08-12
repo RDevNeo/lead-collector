@@ -1,19 +1,19 @@
 // ==UserScript==
-// @name         Discord Invite Collector
-// @namespace    https://github.com/RDevNeo/discord-invite-collector
+// @name         Lead Collector
+// @namespace    https://github.com/RDevNeo/lead-collector
 // @version      1.10.16
 // @description  Collect Discord server invites, and YouTube creator profiles, into SpokPayCRM.
 // @author       RDevNeo
 // @license      MIT
-// @homepageURL  https://github.com/RDevNeo/discord-invite-collector
-// @supportURL   https://github.com/RDevNeo/discord-invite-collector/issues
+// @homepageURL  https://github.com/RDevNeo/lead-collector
+// @supportURL   https://github.com/RDevNeo/lead-collector/issues
 // @match        https://discord.com/*
 // @match        https://*.discord.com/*
 // @match        https://www.youtube.com/*
 // @match        https://m.youtube.com/*
 // @grant        none
-// @updateURL    https://raw.githubusercontent.com/RDevNeo/discord-invite-collector/main/discord-invite-collector.user.js
-// @downloadURL  https://raw.githubusercontent.com/RDevNeo/discord-invite-collector/main/discord-invite-collector.user.js
+// @updateURL    https://raw.githubusercontent.com/RDevNeo/lead-collector/main/lead-collector.user.js
+// @downloadURL  https://raw.githubusercontent.com/RDevNeo/lead-collector/main/lead-collector.user.js
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -3537,7 +3537,7 @@
             <button class="dic-light yellow" id="dic-minimize" title="Minimize"></button>
             <button class="dic-light green" id="dic-toggle-size" title="Toggle size"></button>
           </div>
-          <span>Discord Invite Collector</span>
+          <span>Lead Collector</span>
         </div>
         <div id="dic-header-meta">
           <div id="dic-version">v${SCRIPT_VERSION}</div>

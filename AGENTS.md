@@ -4,8 +4,8 @@ Keep this file and `CLAUDE.md` identical — they are the same rules for differe
 
 ## What this project is
 
-A single-file Tampermonkey userscript (`discord-invite-collector.user.js`) that runs on Discord web
-and collects server invite URLs. There is no build step, no bundler, no `package.json`, and no
+A single-file Tampermonkey userscript (`lead-collector.user.js`) that runs on Discord web
+and YouTube, collecting server invites and YouTube creator profiles. There is no build step, no bundler, no `package.json`, and no
 dependencies. The file you edit is byte-for-byte the file users install.
 
 Two consequences that constrain every change:
@@ -28,7 +28,7 @@ users (docs, CI, this file).
 ## Required: end every code change with the update instructions
 
 Distribution is `@updateURL`/`@downloadURL` pointing at the raw file on `main`. There is no proxy and
-no secret. After **any** change to `discord-invite-collector.user.js`, close out by telling the user,
+no secret. After **any** change to `lead-collector.user.js`, close out by telling the user,
 explicitly and in full:
 
 1. **Push to `main`.** Nothing reaches users until it is pushed — CI bumps the patch version on that
@@ -43,7 +43,7 @@ explicitly and in full:
 Always include the install URL literally so it can be clicked:
 
 ```
-https://raw.githubusercontent.com/RDevNeo/discord-invite-collector/main/discord-invite-collector.user.js
+https://raw.githubusercontent.com/RDevNeo/lead-collector/main/lead-collector.user.js
 ```
 
 If a change altered `@name` or `@namespace`, say plainly that this one needs a manual reinstall — do

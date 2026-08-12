@@ -1,4 +1,4 @@
-# Discord Invite Collector
+# Lead Collector
 
 A [Tampermonkey](https://www.tampermonkey.net/) userscript that collects prospecting leads into a
 session list you can copy out in one click. Two tabs:
@@ -14,7 +14,7 @@ CRM is fed by pasting, never by an automatic import.
 
 1. Install the [Tampermonkey](https://www.tampermonkey.net/) browser extension.
 2. Click
-   **[install the script](https://raw.githubusercontent.com/RDevNeo/discord-invite-collector/main/discord-invite-collector.user.js)**
+   **[install the script](https://raw.githubusercontent.com/RDevNeo/lead-collector/main/lead-collector.user.js)**
    — Tampermonkey recognizes the `// ==UserScript==` header and opens its install prompt. (Installing
    from this URL is what registers the auto-update source; a copy-pasted script never updates itself.)
 3. Open Discord web (`https://discord.com/*`) or YouTube (`https://www.youtube.com/*`) — the

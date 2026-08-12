@@ -1,6 +1,6 @@
-# Tampermonkey Discord Invite Collector
+# Tampermonkey Lead Collector
 
-This doc describes `discord-invite-collector.user.js`, the Tampermonkey userscript used on Discord web.
+This doc describes `lead-collector.user.js`, the Tampermonkey userscript used on Discord web and YouTube.
 
 ## What it is
 
@@ -45,5 +45,5 @@ leak into Discord's own styles.
 
 ## Related files
 
-- `discord-invite-collector.user.js`
+- `lead-collector.user.js`
 - `README.md` for install and auto-update

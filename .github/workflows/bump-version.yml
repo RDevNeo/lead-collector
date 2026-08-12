@@ -10,7 +10,7 @@ on:
   push:
     branches: [main]
     paths:
-      - "discord-invite-collector.user.js"
+      - "lead-collector.user.js"
 
 permissions:
   contents: write
@@ -30,7 +30,7 @@ jobs:
         id: bump
         run: |
           set -euo pipefail
-          FILE="discord-invite-collector.user.js"
+          FILE="lead-collector.user.js"
           current="$(grep -oE '^// @version[[:space:]]+[0-9]+\.[0-9]+\.[0-9]+' "$FILE" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
           IFS='.' read -r MAJOR MINOR PATCH <<< "$current"
           new="${MAJOR}.${MINOR}.$((PATCH + 1))"
@@ -48,6 +48,6 @@ jobs:
           fi
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add discord-invite-collector.user.js
+          git add lead-collector.user.js
           git commit -m "chore: bump userscript version to ${{ steps.bump.outputs.new }} [skip-bump]"
           git push
