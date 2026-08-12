@@ -1,10 +1,14 @@
 # Discord Invite Collector
 
-A [Tampermonkey](https://www.tampermonkey.net/) userscript that scans Discord web pages for server
-invite URLs and collects them into a session list you can copy out in one click.
+A [Tampermonkey](https://www.tampermonkey.net/) userscript that collects prospecting leads into a
+session list you can copy out in one click. Two tabs:
 
-It is fully self-contained: no API, no database, no external requests. Whatever it finds stays in the
-panel and in `localStorage` until you copy or clear it.
+- **Servers** — scans Discord web pages for server invite URLs.
+- **Creators** — sweeps YouTube search for channels and collects them as SpokPayCRM creator records.
+
+It is fully self-contained: no API key, no database, no external service. Nothing is ever sent
+anywhere — whatever it finds stays in the panel and in `localStorage` until you copy or clear it. The
+CRM is fed by pasting, never by an automatic import.
 
 ## Install
 
@@ -13,12 +17,54 @@ panel and in `localStorage` until you copy or clear it.
    **[install the script](https://raw.githubusercontent.com/RDevNeo/discord-invite-collector/main/discord-invite-collector.user.js)**
    — Tampermonkey recognizes the `// ==UserScript==` header and opens its install prompt. (Installing
    from this URL is what registers the auto-update source; a copy-pasted script never updates itself.)
-3. Open Discord web (`https://discord.com/*`) — the collector panel is injected on load.
+3. Open Discord web (`https://discord.com/*`) or YouTube (`https://www.youtube.com/*`) — the
+   collector panel is injected on load, opening on whichever tab that site can run.
 
 Works on Discord **web** in any desktop browser with a userscript manager. It does not run inside the
 Discord desktop app, which has no userscript support.
 
-## Modes
+## Tabs
+
+The panel opens on the tab the current site can actually run: Discord shows **Servers**, YouTube shows
+**Creators**. Selecting the other tab tells you where to go rather than offering controls that cannot
+work — server collection drives the Discord DOM, creator collection reads YouTube's own data.
+
+## Creators (YouTube)
+
+Type a search term (e.g. `roblox blox fruits`) and press Start. The sweep reads YouTube's
+channel-filtered search results, then opens each channel's About data for its stats and profile links.
+**Copy** puts the batch on your clipboard as JSONL — one complete JSON record per line — which is what
+**SpokPayCRM → Creators → Import** expects. You paste it there yourself; nothing is imported
+automatically.
+
+| Field | Notes |
+| --- | --- |
+| `platform_id` | The `UC…` channel id — the record's stable identity |
+| `handle`, `name`, `profile_url`, `avatar_url` | From the channel's canonical About data |
+| `subscriber_count`, `video_count`, `view_count` | `null` when the channel hides the count — **not** `0` |
+| `description`, `country` | From About |
+| `links` | Profile links, with YouTube's `/redirect?q=` wrapper unwrapped |
+| `discovered_via`, `captured_at` | Which search found them, and when |
+
+The profile links matter most: that is where a creator's Instagram, TikTok and Discord live. The CRM
+flags a creator whose links include a `discord.gg` invite, since someone already running a server is a
+materially stronger lead.
+
+### Why the Creators tab reads JSON instead of clicking the page
+
+The Servers tab drives the DOM because Discord only renders invite data in response to clicks. YouTube
+does not: every page embeds a `ytInitialData` blob containing the channel list and the whole About
+panel, so the sweep reads that. It is language-independent (no wordlists), survives cosmetic layout
+changes, never navigates your tab or scrolls the page, and needs no per-channel page load in the UI.
+
+Two traps that cost real bugs while building it, both verified against live YouTube HTML:
+
+- In search results the field names **lie**: `subscriberCountText` holds the *@handle* and
+  `videoCountText` holds the *subscriber count*.
+- A link's `link.content` is only display text (`twitter.com/BloxFruits`); the real URL lives on the
+  tap command and needs unwrapping from the `/redirect?q=` form.
+
+## Server modes
 
 | Mode | What it does |
 | --- | --- |

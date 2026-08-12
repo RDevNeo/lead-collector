@@ -2,13 +2,15 @@
 // @name         Discord Invite Collector
 // @namespace    https://github.com/RDevNeo/discord-invite-collector
 // @version      1.10.16
-// @description  Collect Discord invite URLs from member profiles, Discover or a channel's messages.
+// @description  Collect Discord server invites, and YouTube creator profiles, into SpokPayCRM.
 // @author       RDevNeo
 // @license      MIT
 // @homepageURL  https://github.com/RDevNeo/discord-invite-collector
 // @supportURL   https://github.com/RDevNeo/discord-invite-collector/issues
 // @match        https://discord.com/*
 // @match        https://*.discord.com/*
+// @match        https://www.youtube.com/*
+// @match        https://m.youtube.com/*
 // @grant        none
 // @updateURL    https://raw.githubusercontent.com/RDevNeo/discord-invite-collector/main/discord-invite-collector.user.js
 // @downloadURL  https://raw.githubusercontent.com/RDevNeo/discord-invite-collector/main/discord-invite-collector.user.js
@@ -79,6 +81,395 @@
 
   const SCRIPT_VERSION = "1.10.16";
 
+  // ===========================================================================
+  // Site detection
+  //
+  // The panel now runs on two sites. Server collection drives the Discord DOM
+  // and is meaningless on YouTube; creator collection reads YouTube's own JSON
+  // and is meaningless on Discord. So the tab matching the current site is the
+  // one that can actually run, and the other explains where to go.
+  // ===========================================================================
+  const SITE = /(^|\.)youtube\.com$/i.test(location.hostname) ? "youtube" : "discord";
+
+  // Run one creator sweep: channel-filtered search, paginated, then one About
+  // read per new channel. Appends complete records to `state.creators`.
+  async function collectCreators(query) {
+    const capturedAt = new Date().toISOString();
+    const known = new Set((loadState().creators || []).map((row) => row.platform_id));
+    let discovered = [];
+    let dryPages = 0;
+
+    log(`Searching YouTube channels for "${query}"...`);
+    let data = await ytFetchSearch(query);
+
+    for (let page = 0; page < YT_MAX_PAGES; page += 1) {
+      if (stopRequested) break;
+      const batch = ytChannelsFromSearch(data).filter((entry) => !known.has(entry.channelId));
+      batch.forEach((entry) => known.add(entry.channelId));
+      discovered = discovered.concat(batch);
+
+      if (batch.length === 0) {
+        dryPages += 1;
+        if (dryPages >= YT_DRY_PAGE_LIMIT) {
+          log(`No new channels for ${dryPages} pages - stopping.`);
+          break;
+        }
+      } else {
+        dryPages = 0;
+        log(`Page ${page + 1}: ${batch.length} new channel(s).`);
+      }
+
+      const command = ytFind(data, "continuationCommand");
+      const token = command && command.token;
+      if (!token) break;
+      const next = await ytFetchContinuation(token);
+      if (!next) break;
+      data = next;
+    }
+
+    if (discovered.length === 0) {
+      log("Nothing new found for that term.");
+      return;
+    }
+
+    log(`Reading ${discovered.length} channel page(s) for links and stats...`);
+    for (const entry of discovered) {
+      if (stopRequested) break;
+      try {
+        const detail = await ytEnrichChannel(entry.channelId);
+        const record = {
+          platform: "youtube",
+          platform_id: entry.channelId,
+          name: detail.name || entry.name || entry.channelId,
+          handle: detail.handle || entry.handle,
+          profile_url: detail.profileUrl || entry.profileUrl,
+          avatar_url: detail.avatarUrl || entry.avatarUrl,
+          subscriber_count: detail.subscribers ?? entry.subscribers ?? null,
+          video_count: detail.videos,
+          view_count: detail.views,
+          description: detail.description || entry.description || null,
+          links: detail.links,
+          country: detail.country,
+          discovered_via: query,
+          captured_at: capturedAt,
+        };
+        const state = loadState();
+        state.creators = (state.creators || []).concat([record]);
+        saveState(state);
+        const subs = record.subscriber_count === null ? "hidden" : record.subscriber_count;
+        log(`OK ${record.name} - ${subs} subs, ${record.links.length} link(s)`);
+      } catch (err) {
+        // One unreadable channel must never abort the sweep.
+        const message = err instanceof Error ? err.message : String(err);
+        log(`SKIP ${entry.name || entry.channelId}: ${message}`);
+      }
+      refreshUI();
+      await sleep(YT_ENRICH_DELAY_MS);
+    }
+  }
+
+  // --- YouTube creator collection --------------------------------------------
+  //
+  // Unlike the Discord side, this does NOT drive the DOM. Every YouTube page
+  // embeds a `ytInitialData` JSON blob that already contains the channel list
+  // and the whole About panel, so the collector reads that instead. That is
+  // strictly better here: it is language-independent (no wordlists), it survives
+  // cosmetic UI changes, it never navigates the operator's tab or scrolls the
+  // page, and it needs no per-channel page load in the UI.
+  //
+  // Everything is same-origin `fetch` against youtube.com using the operator's
+  // own session. No API key, no external service — the script stays secret-free
+  // and the CRM is still fed by copy-paste.
+
+  // YouTube encodes result-type filters in the `sp` query param; this is the
+  // documented "Channel" value, so the sweep reads channel records directly
+  // instead of inferring uploaders from video results.
+  const YT_CHANNEL_FILTER = "EgIQAg%3D%3D";
+  const YT_MAX_PAGES = 5;
+  const YT_DRY_PAGE_LIMIT = 2;
+  const YT_ENRICH_DELAY_MS = 350;
+
+  // Depth-first search for the first object carrying `key`. Used instead of
+  // fixed paths into `ytInitialData`: YouTube reshuffles renderer nesting often,
+  // but the leaf renderer NAMES are stable, so searching for the leaf survives
+  // layout churn a hardcoded path would not.
+  function ytFind(node, key, depth = 0) {
+    if (!node || typeof node !== "object" || depth > 45) return null;
+    if (Object.prototype.hasOwnProperty.call(node, key)) return node[key];
+    for (const value of Array.isArray(node) ? node : Object.values(node)) {
+      const found = ytFind(value, key, depth + 1);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  function ytCollect(node, key, out = [], depth = 0) {
+    if (!node || typeof node !== "object" || depth > 45) return out;
+    if (Object.prototype.hasOwnProperty.call(node, key)) out.push(node[key]);
+    for (const value of Array.isArray(node) ? node : Object.values(node)) {
+      ytCollect(value, key, out, depth + 1);
+    }
+    return out;
+  }
+
+  // Flatten YouTube's several text shapes: {simpleText}, {runs:[{text}]},
+  // {content}, and — on the About panel — bare strings.
+  function ytText(node) {
+    if (!node) return "";
+    if (typeof node === "string") return node;
+    if (typeof node.simpleText === "string") return node.simpleText;
+    if (typeof node.content === "string") return node.content;
+    if (Array.isArray(node.runs)) return node.runs.map((run) => run.text ?? "").join("");
+    return "";
+  }
+
+  // Parse a localized compact count: "3.15M subscribers", "1,2 mi de inscritos",
+  // "383K subscribers", "440,004,410 views".
+  //
+  // Returns null — NOT 0 — when nothing parseable is present, because YouTube
+  // omits the line entirely for channels that hide their subscriber count, and
+  // "hidden" must never be recorded as "zero".
+  function ytParseCount(raw) {
+    const text = ytText(raw).trim();
+    if (!text) return null;
+    const match = text.match(/([\d][\d.,\s\u00a0]*)\s*([a-zA-Z\u00b5]*)/);
+    if (!match) return null;
+
+    let digits = match[1].replace(/[\s\u00a0]/g, "");
+    const suffix = (match[2] || "").toLowerCase();
+
+    // Decide which separator is the decimal point. With both present the LAST
+    // wins (1.234,5 vs 1,234.5); with one present it is a decimal separator only
+    // when it splits off 1-2 trailing digits ("1,2 mi"), else it groups
+    // thousands ("1,234").
+    const lastComma = digits.lastIndexOf(",");
+    const lastDot = digits.lastIndexOf(".");
+    if (lastComma >= 0 && lastDot >= 0) {
+      const at = Math.max(lastComma, lastDot);
+      digits = digits.slice(0, at).replace(/[.,]/g, "") + "." + digits.slice(at + 1);
+    } else if (lastComma >= 0 || lastDot >= 0) {
+      const at = Math.max(lastComma, lastDot);
+      const tail = digits.length - at - 1;
+      digits =
+        tail <= 2 ? digits.slice(0, at) + "." + digits.slice(at + 1) : digits.replace(/[.,]/g, "");
+    }
+
+    const value = Number.parseFloat(digits);
+    if (!Number.isFinite(value)) return null;
+
+    return Math.round(value * ytMultiplier(suffix));
+  }
+
+  // Scale word for a parsed count. Handles BOTH the compact form ("3.15M") and
+  // the long form YouTube puts in its accessibility label ("3.15 million
+  // subscribers") — reading only the compact form recorded that channel as
+  // having 3 subscribers.
+  //
+  // Order matters: Portuguese/Spanish "mil" is a THOUSAND while "milhão" /
+  // "millón" are a million, and they share a prefix. The exact "mil" test has to
+  // come before the million prefixes or every pt-BR count is off by 1000x.
+  function ytMultiplier(suffix) {
+    if (!suffix) return 1;
+    if (suffix === "mil" || suffix === "k" || suffix === "tsd") return 1e3;
+    if (suffix.startsWith("thousand")) return 1e3;
+    if (suffix === "b" || suffix === "bn" || suffix === "mrd") return 1e9;
+    if (suffix.startsWith("bi") || suffix.startsWith("bill") || suffix.startsWith("bilh")) {
+      return 1e9;
+    }
+    if (suffix === "m" || suffix === "mi" || suffix === "mio") return 1e6;
+    if (suffix.startsWith("mill") || suffix.startsWith("milh") || suffix.startsWith("mio")) {
+      return 1e6;
+    }
+    // Unknown word: no multiplier, which is the safe reading of a plain group.
+    return 1;
+  }
+
+  // Unwrap YouTube's link redirector. Profile links are rendered as
+  // `https://www.youtube.com/redirect?...&q=<encoded target>`; storing the
+  // redirector would make both the CRM's Discord detection and the operator's
+  // click useless.
+  function ytUnwrapRedirect(url) {
+    if (!url) return "";
+    try {
+      const parsed = new URL(url, "https://www.youtube.com");
+      if (parsed.pathname === "/redirect") {
+        const target = parsed.searchParams.get("q");
+        if (target) return decodeURIComponent(target);
+      }
+      return parsed.toString();
+    } catch {
+      return url;
+    }
+  }
+
+  // Pull the real destination out of one About-panel link.
+  //
+  // NOTE `link.content` is only the DISPLAY text ("twitter.com/BloxFruits") —
+  // scheme-less and sometimes truncated. The actual URL lives on the tap
+  // command, so that is read first and the display text is only a fallback.
+  function ytLinkUrl(entry) {
+    const run = entry && entry.link && entry.link.commandRuns && entry.link.commandRuns[0];
+    const command = run && run.onTap && run.onTap.innertubeCommand;
+    const raw =
+      (command && command.urlEndpoint && command.urlEndpoint.url) ||
+      (command &&
+        command.commandMetadata &&
+        command.commandMetadata.webCommandMetadata &&
+        command.commandMetadata.webCommandMetadata.url);
+    if (raw) return ytUnwrapRedirect(raw);
+    const shown = entry && entry.link && entry.link.content;
+    if (!shown) return "";
+    return shown.includes("://") ? shown : `https://${shown}`;
+  }
+
+  function ytExtractInitialData(html) {
+    const match =
+      html.match(/var ytInitialData\s*=\s*(\{.+?\});\s*<\/script>/s) ||
+      html.match(/ytInitialData"\]\s*=\s*(\{.+?\});/s) ||
+      html.match(/var ytInitialData\s*=\s*(\{.+?\});/s);
+    if (!match) return null;
+    try {
+      return JSON.parse(match[1]);
+    } catch {
+      return null;
+    }
+  }
+
+  async function ytFetchSearch(query) {
+    const url = `https://www.youtube.com/results?search_query=${encodeURIComponent(
+      query,
+    )}&sp=${YT_CHANNEL_FILTER}`;
+    const res = await fetch(url, { credentials: "include" });
+    if (!res.ok) throw new Error(`search HTTP ${res.status}`);
+    const data = ytExtractInitialData(await res.text());
+    if (!data) throw new Error("could not read YouTube search data");
+    return data;
+  }
+
+  async function ytFetchContinuation(token) {
+    const cfg = window.ytcfg;
+    const apiKey = cfg && cfg.get && cfg.get("INNERTUBE_API_KEY");
+    if (!apiKey) return null;
+    const res = await fetch(`https://www.youtube.com/youtubei/v1/search?key=${apiKey}`, {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        context: {
+          client: {
+            clientName: "WEB",
+            clientVersion: (cfg.get && cfg.get("INNERTUBE_CLIENT_VERSION")) || "2.20240101.00.00",
+            hl: (cfg.get && cfg.get("HL")) || "en",
+            gl: (cfg.get && cfg.get("GL")) || "US",
+          },
+        },
+        continuation: token,
+      }),
+    });
+    if (!res.ok) throw new Error(`continuation HTTP ${res.status}`);
+    return await res.json();
+  }
+
+  // Read channel entries out of a search payload.
+  //
+  // BEWARE the field names, which are actively misleading and were confirmed
+  // against live search HTML:
+  //   • `subscriberCountText` holds the @HANDLE  ("@jujubotv")
+  //   • `videoCountText`      holds the SUBSCRIBER COUNT ("3.15M subscribers")
+  // Taking them at face value silently swaps a channel's handle and its
+  // audience size, so both are read through the names they actually carry.
+  function ytChannelsFromSearch(data) {
+    const out = [];
+    for (const renderer of ytCollect(data, "channelRenderer")) {
+      const channelId = renderer.channelId;
+      if (!channelId) continue;
+      const canonical =
+        (renderer.navigationEndpoint &&
+          renderer.navigationEndpoint.browseEndpoint &&
+          renderer.navigationEndpoint.browseEndpoint.canonicalBaseUrl) ||
+        "";
+      const handleFromCanonical = canonical.match(/@[\w.-]+/);
+      const handleText = ytText(renderer.subscriberCountText).trim();
+      const thumbs = (renderer.thumbnail && renderer.thumbnail.thumbnails) || [];
+      const avatar = thumbs.length ? thumbs[thumbs.length - 1].url : null;
+      out.push({
+        channelId,
+        name: ytText(renderer.title),
+        handle: handleFromCanonical
+          ? handleFromCanonical[0]
+          : handleText.startsWith("@")
+            ? handleText
+            : null,
+        profileUrl: canonical
+          ? `https://www.youtube.com${canonical}`
+          : `https://www.youtube.com/channel/${channelId}`,
+        avatarUrl: avatar ? (avatar.startsWith("//") ? `https:${avatar}` : avatar) : null,
+        // The accessibility label ("3.15 million subscribers") is the long form
+        // and parses more reliably than the compact one when both exist.
+        // Compact form first ("3.15M subscribers"): it is unambiguous. The
+        // accessibility label ("3.15 million subscribers") is the fallback for
+        // renderers that omit the compact text.
+        subscribers:
+          ytParseCount(renderer.videoCountText) ??
+          ytParseCount(
+            renderer.videoCountText &&
+              renderer.videoCountText.accessibility &&
+              renderer.videoCountText.accessibility.accessibilityData &&
+              renderer.videoCountText.accessibility.accessibilityData.label,
+          ),
+        description: ytText(renderer.descriptionSnippet),
+      });
+    }
+    return out;
+  }
+
+  // Fetch one channel's About data — where the profile links live, i.e. the
+  // Instagram / TikTok / Discord the operator actually needs to reach out.
+  async function ytEnrichChannel(channelId) {
+    const res = await fetch(`https://www.youtube.com/channel/${channelId}/about`, {
+      credentials: "include",
+    });
+    if (!res.ok) throw new Error(`channel HTTP ${res.status}`);
+    const data = ytExtractInitialData(await res.text());
+    if (!data) throw new Error("could not read channel data");
+
+    const about = ytFind(data, "aboutChannelViewModel") || {};
+    const microformat = ytFind(data, "microformatDataRenderer") || {};
+
+    const links = [];
+    for (const wrapper of about.links || []) {
+      const entry = wrapper && wrapper.channelExternalLinkViewModel;
+      if (!entry) continue;
+      const url = ytLinkUrl(entry);
+      if (!url || links.some((link) => link.url === url)) continue;
+      links.push({ label: ytText(entry.title) || null, url });
+    }
+
+    // `canonicalChannelUrl` comes back as http:// — normalize so the stored
+    // profile link does not downgrade the operator's click.
+    const canonical = (about.canonicalChannelUrl || microformat.urlCanonical || "").replace(
+      /^http:\/\//,
+      "https://",
+    );
+    const handleMatch = canonical.match(/@[\w.-]+/);
+    const thumbs =
+      (microformat.thumbnail && microformat.thumbnail.thumbnails) || [];
+
+    return {
+      name: microformat.title || null,
+      handle: handleMatch ? handleMatch[0] : null,
+      profileUrl: canonical || null,
+      avatarUrl: thumbs.length ? thumbs[thumbs.length - 1].url : null,
+      subscribers: ytParseCount(about.subscriberCountText),
+      videos: ytParseCount(about.videoCountText),
+      views: ytParseCount(about.viewCountText),
+      description: ytText(about.description) || microformat.description || null,
+      country: about.country || null,
+      links,
+    };
+  }
+
+
   const DISCOVER_DRY_STREAK_LIMIT = 4;
 
   const DISCOVER_CATEGORY_LABEL_PATTERN =
@@ -98,6 +489,19 @@
   let inviteButtonLabel = "";
 
   const ICONS = {
+    // Tab glyphs. Drawn in `currentColor` so each takes its tab's own state
+    // colour rather than needing an active/inactive variant.
+    discord: `
+      <svg aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="currentColor">
+        <path d="M20.317 4.37a19.79 19.79 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.865-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.058a.082.082 0 0 0 .031.056 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028c.462-.63.874-1.295 1.226-1.994a.076.076 0 0 0-.041-.106 13.1 13.1 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.928 1.793 8.18 1.793 12.061 0a.074.074 0 0 1 .079.009c.12.099.246.198.373.293a.077.077 0 0 1-.006.127 12.3 12.3 0 0 1-1.873.891.077.077 0 0 0-.041.107c.36.698.772 1.363 1.225 1.993a.076.076 0 0 0 .084.029 19.84 19.84 0 0 0 6.002-3.03.077.077 0 0 0 .032-.055c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.029zM8.02 15.331c-1.183 0-2.157-1.086-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.095 2.157 2.42 0 1.332-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.086-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.095 2.157 2.42 0 1.332-.946 2.418-2.157 2.418z"></path>
+      </svg>
+    `,
+    person: `
+      <svg aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"></path>
+        <circle cx="12" cy="7" r="4"></circle>
+      </svg>
+    `,
     play: `
       <svg aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <path d="M5 5a2 2 0 0 1 3.008-1.728l11.997 6.998a2 2 0 0 1 .003 3.458l-12 7A2 2 0 0 1 5 19z"></path>
@@ -197,12 +601,44 @@
       discoverLastBrowseAt: 0,
       serverIndex: 0,
       inviteUrls: [],
+      // Creator tab state. Kept alongside the invite state rather than in a
+      // second store so one Clear/Copy/log surface serves both tabs.
+      activeTab: SITE === "youtube" ? "creators" : "servers",
+      creatorQuery: "",
+      creators: [],
       currentServer: null,
       log: "",
       statusText: "",
       inviteCount: 0,
       savedAt: 0,
     };
+  }
+
+  // The panel tab. Defaults to whichever tab the CURRENT SITE can actually run,
+  // so opening YouTube lands on Creators without a click and opening Discord
+  // lands on Servers.
+  function getActiveTab() {
+    const state = loadState();
+    const stored = state.activeTab === "creators" || state.activeTab === "servers" ? state.activeTab : null;
+    return stored ?? (SITE === "youtube" ? "creators" : "servers");
+  }
+
+  function setActiveTab(tab) {
+    const state = loadState();
+    state.activeTab = tab === "creators" ? "creators" : "servers";
+    saveState(state);
+    refreshUI();
+  }
+
+  function getCreatorQuery() {
+    return String(loadState().creatorQuery || "").trim();
+  }
+
+  function setCreatorQuery(value) {
+    const state = loadState();
+    state.creatorQuery = String(value || "");
+    saveState(state);
+    refreshUI();
   }
 
   function getCollectorMode() {
@@ -2460,14 +2896,61 @@
     const discoverCardEl = document.getElementById("dic-discover-card");
     const discoverCardValueEl = document.getElementById("dic-discover-card-value");
     const indicator = document.getElementById("dic-indicator");
+    const tab = getActiveTab();
+    const creators = state.creators || [];
+    // The tab that matches the current site is the only one that can run: server
+    // collection drives the Discord DOM, creator collection reads YouTube's JSON.
+    const tabRunnable = tab === "creators" ? SITE === "youtube" : SITE === "discord";
+
+    const tabsEl = document.getElementById("dic-tabs");
+    if (tabsEl) {
+      tabsEl.querySelectorAll(".dic-tab").forEach((button) => {
+        button.classList.toggle("active", button.dataset.tab === tab);
+      });
+    }
+    const creatorRow = document.getElementById("dic-creator-row");
+    const creatorInput = document.getElementById("dic-creator-query");
+    const hintEl = document.getElementById("dic-site-hint");
+    const serverOnly = [
+      document.getElementById("dic-mode-row"),
+      document.getElementById("dic-discover-row"),
+      document.getElementById("dic-discover-language-row"),
+    ];
+
+    if (hintEl) {
+      hintEl.style.display = tabRunnable ? "none" : "";
+      hintEl.textContent =
+        tab === "creators"
+          ? "Open youtube.com to sweep creators."
+          : "Open discord.com to collect server invites.";
+    }
+    if (creatorRow) creatorRow.style.display = tab === "creators" && tabRunnable ? "" : "none";
+    if (creatorInput && document.activeElement !== creatorInput) {
+      creatorInput.value = state.creatorQuery || "";
+    }
+
     const startLabel =
-      mode === "discover" ? "Start Discover" : mode === "reader" ? "Start Reader" : "Start";
+      tab === "creators"
+        ? "Start YouTube sweep"
+        : mode === "discover"
+          ? "Start Discover"
+          : mode === "reader"
+            ? "Start Reader"
+            : "Start";
 
     if (startButton) {
-      startButton.disabled = state.running || (mode === "discover" && !getDiscoverQuery());
+      startButton.disabled =
+        state.running ||
+        !tabRunnable ||
+        (tab === "creators" && !getCreatorQuery()) ||
+        (tab === "servers" && mode === "discover" && !getDiscoverQuery());
     }
     if (stopButton) stopButton.disabled = !state.running;
-    if (copyButton) copyButton.disabled = state.running || (state.inviteUrls || []).length === 0;
+    if (copyButton) {
+      copyButton.disabled =
+        state.running ||
+        (tab === "creators" ? creators.length === 0 : (state.inviteUrls || []).length === 0);
+    }
     if (clearInvitesButton) clearInvitesButton.disabled = false;
     if (clearLogButton) clearLogButton.disabled = !(state.log || "").length;
     if (copyLogButton) copyLogButton.disabled = !(state.log || "").length;
@@ -2478,13 +2961,23 @@
     setIconButtonContent(clearLogButton, "Clear log", ICONS.trash);
     setIconButtonContent(copyLogButton, "Copy log", ICONS.copy);
     if (modeSelect) modeSelect.value = mode;
-    if (discoverRow) discoverRow.style.display = mode === "discover" ? "block" : "none";
+    // Mode/Discover rows belong to the Servers tab only.
+    const showServerRows = tab === "servers" && tabRunnable;
+    const modeRow = document.getElementById("dic-mode-row");
+    if (modeRow) modeRow.style.display = showServerRows ? "" : "none";
+    if (discoverRow) {
+      discoverRow.style.display = showServerRows && mode === "discover" ? "block" : "none";
+    }
     if (discoverInput) discoverInput.value = state.discoverQuery || "";
-    if (languageRow) languageRow.style.display = mode === "discover" ? "block" : "none";
+    if (languageRow) {
+      languageRow.style.display = showServerRows && mode === "discover" ? "block" : "none";
+    }
     if (languageSelect) renderDiscoverLanguageOptions(languageSelect, state.running);
     if (status) status.textContent = "";
     if (countEl) {
-      countEl.textContent = `${(state.inviteUrls || []).length}`;
+      countEl.textContent = `${
+        tab === "creators" ? creators.length : (state.inviteUrls || []).length
+      }`;
     }
     if (discoverCardEl) {
       const discoverCardIndex = state.running && mode === "discover" ? Number(state.discoverCardCursor) || 0 : 0;
@@ -2516,8 +3009,21 @@
     refreshUI();
   }
 
+  // Copy the ACTIVE tab's collection. Invites go out as one URL per line (what
+  // the board's invite box expects); creators go out as JSONL — one complete
+  // JSON record per line — which is what SpokPayCRM's creator import parses.
+  // One object per line rather than one big array means a truncated clipboard
+  // degrades to "fewer creators" instead of a total parse failure.
   async function copyCollectedUrls() {
     const state = loadState();
+    if (getActiveTab() === "creators") {
+      const rows = state.creators || [];
+      await navigator.clipboard.writeText(rows.map((row) => JSON.stringify(row)).join("\n"));
+      setStatus(
+        `Copied ${rows.length} creator(s). Paste into SpokPayCRM > Creators > Import.`,
+      );
+      return;
+    }
     const text = (state.inviteUrls || []).join("\n");
     await navigator.clipboard.writeText(text);
     setStatus(`Copied invite URLs to clipboard. ${formatCollectionSummary(state.inviteUrls.length)}`);
@@ -2525,6 +3031,13 @@
 
   function clearCollectedInvites() {
     const state = loadState();
+    if (getActiveTab() === "creators") {
+      state.creators = [];
+      saveState(state);
+      refreshUI();
+      setStatus("");
+      return;
+    }
     state.inviteUrls = [];
     state.inviteCount = 0;
     state.discoverCardCursor = 0;
@@ -2583,6 +3096,19 @@
     }
 
     return { added, skippedInvalid };
+  }
+
+  // A creator sweep has no resume path (unlike Discover, which reattaches). If a
+  // tab was closed mid-sweep the persisted `running: true` would leave Start
+  // disabled forever, so clear it on load when nothing can resume it.
+  function clearStaleRunningFlag() {
+    const state = loadState();
+    if (!state.running) return;
+    if (SITE === "youtube" || getActiveTab() === "creators") {
+      state.running = false;
+      state.statusText = "";
+      saveState(state);
+    }
   }
 
   function createUI() {
@@ -2707,11 +3233,61 @@
         #dic-body {
           padding: 12px;
         }
+        #dic-tabs {
+          display: flex;
+          gap: 4px;
+          padding: 4px;
+          margin-bottom: 10px;
+          border: 1px solid rgba(255, 255, 255, 0.06);
+          border-radius: 10px;
+          background: rgba(255, 255, 255, 0.03);
+        }
+        .dic-tab {
+          flex: 1;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          gap: 6px;
+          padding: 6px 10px;
+          border: 1px solid transparent;
+          border-radius: 7px;
+          background: transparent;
+          color: rgba(255, 255, 255, 0.5);
+          font: inherit;
+          font-size: 12px;
+          font-weight: 500;
+          cursor: pointer;
+          transition: background 120ms ease, color 120ms ease;
+        }
+        .dic-tab:hover {
+          color: rgba(255, 255, 255, 0.8);
+        }
+        .dic-tab.active {
+          border-color: rgba(255, 255, 255, 0.1);
+          background: rgba(255, 255, 255, 0.08);
+          color: #fff;
+        }
+        .dic-tab svg {
+          width: 14px;
+          height: 14px;
+        }
+        #dic-site-hint {
+          margin-bottom: 10px;
+          padding: 8px 10px;
+          border: 1px dashed rgba(255, 255, 255, 0.12);
+          border-radius: 8px;
+          color: rgba(255, 255, 255, 0.5);
+          font-size: 11px;
+          line-height: 1.45;
+        }
+        #dic-creator-row,
         #dic-mode-row,
+        #dic-creator-row,
         #dic-discover-row,
         #dic-discover-language-row {
           margin-bottom: 10px;
         }
+        #dic-creator-label,
         #dic-mode-label,
         #dic-discover-label,
         #dic-discover-language-label {
@@ -2969,6 +3545,19 @@
         </div>
       </div>
       <div id="dic-body">
+        <div id="dic-tabs" role="tablist">
+          <button class="dic-tab" id="dic-tab-servers" role="tab" data-tab="servers">
+            ${ICONS.discord}<span>Servers</span>
+          </button>
+          <button class="dic-tab" id="dic-tab-creators" role="tab" data-tab="creators">
+            ${ICONS.person}<span>Creators</span>
+          </button>
+        </div>
+        <div id="dic-site-hint" style="display:none"></div>
+        <div id="dic-creator-row" style="display:none">
+          <label id="dic-creator-label" for="dic-creator-query">YouTube</label>
+          <input id="dic-creator-query" type="text" placeholder="ex: roblox blox fruits" autocomplete="off" spellcheck="false" />
+        </div>
         <div id="dic-mode-row">
           <label id="dic-mode-label" for="dic-mode">Mode</label>
           <select id="dic-mode">
@@ -3061,6 +3650,17 @@
     toggleSizeButton.onclick = () => {
       compact = !compact;
       if (!minimized) panel.style.width = compact ? "340px" : "460px";
+    };
+    panel.querySelectorAll(".dic-tab").forEach((button) => {
+      button.onclick = () => setActiveTab(button.dataset.tab);
+    });
+    const creatorInput = panel.querySelector("#dic-creator-query");
+    creatorInput.oninput = () => setCreatorQuery(creatorInput.value);
+    creatorInput.onkeydown = (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        startCollection();
+      }
     };
     modeSelect.onchange = () => setCollectorMode(modeSelect.value);
     languageSelect.onchange = () => setDiscoverLanguage(languageSelect.value);
@@ -3283,6 +3883,39 @@
   async function startCollection() {
     try {
       stopRequested = false;
+
+      // Creator sweeps share the panel's Start/Stop/Copy/Clear/log surface but
+      // none of the Discord flow state (no modes, no Discover watchdog, no
+      // navigation), so they branch out before any of that is touched.
+      if (getActiveTab() === "creators") {
+        const query = getCreatorQuery();
+        if (!query) {
+          setStatus("Type a YouTube search term first.");
+          return;
+        }
+        const creatorState = loadState();
+        creatorState.running = true;
+        creatorState.log = "";
+        creatorState.statusText = "YouTube sweep running...";
+        saveState(creatorState);
+        refreshUI();
+        try {
+          await collectCreators(query);
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          logError(`ERROR: ${message}`, err);
+        }
+        const doneState = loadState();
+        doneState.running = false;
+        const total = (doneState.creators || []).length;
+        doneState.statusText = stopRequested
+          ? `Stopped. ${total} creator(s) collected.`
+          : `Finished. ${total} creator(s) collected.`;
+        saveState(doneState);
+        refreshUI();
+        return;
+      }
+
       // A new run deserves a fresh attempt at the language filter, even if the last one
       // gave up on it.
       discoverLanguageFailures = 0;
@@ -3376,9 +4009,17 @@
     }
   }
 
+  clearStaleRunningFlag();
   createUI();
-  installOffSiteClickGuard();
-  resumeDiscoverCollectionIfNeeded().catch((err) => {
-    logError("Resume failed", err);
-  });
+
+  // Discord-only startup. The off-site click guard exists to stop a Discover
+  // scan wandering out of Discord, and the resume path reattaches an interrupted
+  // Discover flow — both drive the Discord DOM and would be, at best, inert on
+  // YouTube. The panel itself is shared; only this half is gated.
+  if (SITE === "discord") {
+    installOffSiteClickGuard();
+    resumeDiscoverCollectionIfNeeded().catch((err) => {
+      logError("Resume failed", err);
+    });
+  }
 })();
