@@ -91,6 +91,32 @@
   // ===========================================================================
   const SITE = /(^|\.)youtube\.com$/i.test(location.hostname) ? "youtube" : "discord";
 
+  // Creator platforms the Creators tab can be pointed at. YouTube is the only one
+  // with a collector behind it; the others are listed as unavailable so the
+  // dropdown shows where this is going without pretending they work — they are
+  // rendered disabled and cannot be selected.
+  //
+  // `site` is the SITE value the platform's collector needs, and `host` is what
+  // the operator is told to open. Adding a platform later means writing its
+  // collector, adding its host to the @match header, and flipping `available`.
+  const CREATOR_PLATFORMS = [
+    { value: "youtube", label: "YouTube", site: "youtube", host: "youtube.com", available: true },
+    { value: "tiktok", label: "TikTok", site: "tiktok", host: "tiktok.com", available: false },
+    {
+      value: "instagram",
+      label: "Instagram",
+      site: "instagram",
+      host: "instagram.com",
+      available: false,
+    },
+    { value: "twitch", label: "Twitch", site: "twitch", host: "twitch.tv", available: false },
+  ];
+  const CREATOR_PLATFORM_FALLBACK = CREATOR_PLATFORMS.find((entry) => entry.available);
+  const CREATOR_PLATFORM_DEFAULT = CREATOR_PLATFORM_FALLBACK.value;
+  const CREATOR_PLATFORM_SIGNATURE = CREATOR_PLATFORMS.map(
+    (entry) => `${entry.value}${entry.available ? "" : "!"}`,
+  ).join("|");
+
   // Fetch an unfiltered (video) search page, used as the second discovery source.
   async function ytFetchVideoSearch(query) {
     const url = `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`;
@@ -162,15 +188,16 @@
   async function collectCreators(query) {
     const capturedAt = new Date().toISOString();
     const known = new Set((loadState().creators || []).map((row) => row.platform_id));
-    const target = getTargetCount();
+    const platform = getCreatorPlatform();
+    const target = getTargetCount("creators");
     // Over-discover a little: some channels fail their About fetch, and coming up
     // short of the target because of that would be worse than a few extra reads.
-    const wanted = target > 0 ? Math.max(target - currentCollectedCount(), 0) + 5 : 0;
+    const wanted = target > 0 ? Math.max(target - currentCollectedCount("creators"), 0) + 5 : 0;
 
     log(
       target > 0
-        ? `Sweeping YouTube for "${query}" - target ${target} creator(s).`
-        : `Sweeping YouTube for "${query}" - no target, collecting everything.`,
+        ? `Sweeping ${platform.label} for "${query}" - target ${target} creator(s).`
+        : `Sweeping ${platform.label} for "${query}" - no target, collecting everything.`,
     );
 
     let discovered = [];
@@ -208,14 +235,14 @@
     log(`Reading ${discovered.length} channel page(s) for links and stats...`);
     for (const entry of discovered) {
       if (stopRequested) break;
-      if (targetReached()) {
-        log(`Target of ${getTargetCount()} reached.`);
+      if (targetReached("creators")) {
+        log(`Target of ${target} creator(s) reached.`);
         break;
       }
       try {
         const detail = await ytEnrichChannel(entry.channelId);
         const record = {
-          platform: "youtube",
+          platform: platform.value,
           platform_id: entry.channelId,
           name: detail.name || entry.name || entry.channelId,
           handle: detail.handle || entry.handle,
@@ -745,10 +772,18 @@
       // second store so one Clear/Copy/log surface serves both tabs.
       activeTab: SITE === "youtube" ? "creators" : "servers",
       creatorQuery: "",
+      creatorPlatform: CREATOR_PLATFORM_DEFAULT,
       creators: [],
-      // Stop-at count for the ACTIVE tab's collection. 0 / blank means "collect
-      // everything the source will give", which is the old behaviour.
-      targetCount: 0,
+      // Stop-at count, kept PER TAB: the Servers walk stops at N invites and the
+      // Creators sweep stops at N creator records, and each tab remembers its own
+      // number. 0 / blank means "collect everything the source will give", which
+      // is the old behaviour.
+      //
+      // Null, not `{servers: 0, creators: 0}`: loadState merges these defaults
+      // UNDER the stored state, so a zeroed map here would shadow the legacy
+      // shared `targetCount` an upgraded store still carries and silently reset
+      // the operator's number. Null means "nothing chosen yet" — see readTargets.
+      targetCounts: null,
       currentServer: null,
       log: "",
       statusText: "",
@@ -773,33 +808,75 @@
     refreshUI();
   }
 
-  // Target for the active tab: how many leads to stop at. 0 = no target.
-  function getTargetCount() {
-    const raw = Number(loadState().targetCount);
-    return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 0;
+  function targetKey(tab) {
+    return tab === "creators" ? "creators" : "servers";
   }
 
-  function setTargetCount(value) {
+  function normalizeTargetValue(value) {
+    const parsed = Math.floor(Number(String(value ?? "").replace(/[^\d]/g, "")));
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+  }
+
+  // Both tabs' targets, read out of whatever shape the store happens to hold.
+  // Versions up to 1.10.21 kept ONE shared `targetCount`, so a number typed on
+  // Creators also capped a server run; that value now seeds BOTH tabs, which
+  // keeps the operator's last number instead of silently resetting it on upgrade.
+  function readTargets(state) {
+    const legacy = normalizeTargetValue(state.targetCount);
+    const stored =
+      state.targetCounts && typeof state.targetCounts === "object" ? state.targetCounts : {};
+    return {
+      servers: normalizeTargetValue(stored.servers ?? legacy),
+      creators: normalizeTargetValue(stored.creators ?? legacy),
+    };
+  }
+
+  // Target for a tab (the active one unless asked otherwise): how many leads to
+  // stop at. 0 = no target.
+  function getTargetCount(tab = getActiveTab()) {
+    return readTargets(loadState())[targetKey(tab)];
+  }
+
+  function setTargetCount(value, tab = getActiveTab()) {
     const state = loadState();
-    const parsed = Number(String(value).replace(/[^\d]/g, ""));
-    state.targetCount = Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 0;
+    const targets = readTargets(state);
+    targets[targetKey(tab)] = normalizeTargetValue(value);
+    state.targetCounts = targets;
     saveState(state);
     refreshUI();
   }
 
-  // How many the active tab has collected so far — the number a target is
-  // measured against.
-  function currentCollectedCount() {
+  // Steppers move in tens: targets here are batch sizes (50, 100, 250), and a
+  // one-at-a-time step would be a click count nobody wants.
+  const TARGET_STEP = 10;
+
+  function stepTarget(delta) {
+    if (loadState().running) return;
+    setTargetCount(Math.max(0, getTargetCount() + delta));
+
+    // refreshUI deliberately leaves a focused field alone so it never fights
+    // typing — but the arrow keys step it while it IS focused, so the new value
+    // is written back here or the operator would keep seeing the old number.
+    const input = document.getElementById("dic-target");
+    if (input && document.activeElement === input) {
+      const target = getTargetCount();
+      input.value = target > 0 ? String(target) : "";
+    }
+  }
+
+  // How many a tab has collected so far — the number its target is measured
+  // against.
+  function currentCollectedCount(tab = getActiveTab()) {
     const state = loadState();
-    return getActiveTab() === "creators"
+    return targetKey(tab) === "creators"
       ? (state.creators || []).length
       : (state.inviteUrls || []).length;
   }
 
   // True once a target exists and has been met. Checked by both collectors.
-  function targetReached() {
-    const target = getTargetCount();
-    return target > 0 && currentCollectedCount() >= target;
+  function targetReached(tab = getActiveTab()) {
+    const target = getTargetCount(tab);
+    return target > 0 && currentCollectedCount(tab) >= target;
   }
 
   function getCreatorQuery() {
@@ -809,6 +886,23 @@
   function setCreatorQuery(value) {
     const state = loadState();
     state.creatorQuery = String(value || "");
+    saveState(state);
+    refreshUI();
+  }
+
+  // The creator platform in force. Anything unknown — or a platform whose
+  // collector has not been written yet — falls back to YouTube rather than
+  // leaving the tab pointed at something that cannot run.
+  function getCreatorPlatform() {
+    const stored = String(loadState().creatorPlatform || "");
+    const match = CREATOR_PLATFORMS.find((entry) => entry.value === stored);
+    return match && match.available ? match : CREATOR_PLATFORM_FALLBACK;
+  }
+
+  function setCreatorPlatform(value) {
+    const match = CREATOR_PLATFORMS.find((entry) => entry.value === value && entry.available);
+    const state = loadState();
+    state.creatorPlatform = (match || CREATOR_PLATFORM_FALLBACK).value;
     saveState(state);
     refreshUI();
   }
@@ -3071,6 +3165,28 @@
     refreshUI();
   }
 
+  // Platforms without a collector are rendered but `disabled`, so the list reads
+  // as a roadmap and still cannot be selected into a broken state. The option set
+  // is static, so it is built once and only the value is written afterwards —
+  // rebuilding on every refreshUI would close the dropdown under the operator.
+  function renderCreatorPlatformOptions(select, running) {
+    if (select.dataset.dicSignature !== CREATOR_PLATFORM_SIGNATURE) {
+      select.dataset.dicSignature = CREATOR_PLATFORM_SIGNATURE;
+      clearChildren(select);
+
+      for (const platform of CREATOR_PLATFORMS) {
+        const option = document.createElement("option");
+        option.value = platform.value;
+        option.textContent = platform.available ? platform.label : `${platform.label} — soon`;
+        option.disabled = !platform.available;
+        select.appendChild(option);
+      }
+    }
+
+    select.value = getCreatorPlatform().value;
+    select.disabled = Boolean(running);
+  }
+
   function renderDiscoverLanguageOptions(select, running) {
     const selected = getDiscoverLanguage();
     const choices = getDiscoverLanguageChoices();
@@ -3122,9 +3238,11 @@
     const indicator = document.getElementById("dic-indicator");
     const tab = getActiveTab();
     const creators = state.creators || [];
+    const platform = getCreatorPlatform();
     // The tab that matches the current site is the only one that can run: server
-    // collection drives the Discord DOM, creator collection reads YouTube's JSON.
-    const tabRunnable = tab === "creators" ? SITE === "youtube" : SITE === "discord";
+    // collection drives the Discord DOM, creator collection reads the selected
+    // platform's own JSON from the site the operator is signed into.
+    const tabRunnable = tab === "creators" ? SITE === platform.site : SITE === "discord";
 
     const tabsEl = document.getElementById("dic-tabs");
     if (tabsEl) {
@@ -3145,20 +3263,45 @@
       hintEl.style.display = tabRunnable ? "none" : "";
       hintEl.textContent =
         tab === "creators"
-          ? "Open youtube.com to sweep creators."
+          ? `Open ${platform.host} to sweep creators.`
           : "Open discord.com to collect server invites.";
     }
     if (creatorRow) creatorRow.style.display = tab === "creators" && tabRunnable ? "" : "none";
+    if (creatorInput) creatorInput.disabled = state.running;
+    // The source dropdown stays visible on the whole Creators tab, runnable or
+    // not: it is what tells the operator which site to open, and hiding it would
+    // strand anyone whose platform does not match the site they are on.
+    const creatorSourceRow = document.getElementById("dic-creator-source-row");
+    const creatorSourceSelect = document.getElementById("dic-creator-source");
+    if (creatorSourceRow) creatorSourceRow.style.display = tab === "creators" ? "" : "none";
+    if (creatorSourceSelect) renderCreatorPlatformOptions(creatorSourceSelect, state.running);
     const targetRow = document.getElementById("dic-target-row");
+    const targetControl = document.getElementById("dic-target-control");
     const targetInput = document.getElementById("dic-target");
-    // The target applies to whichever tab is collecting, so it shows on both —
-    // but not when the tab can't run on this site.
+    const targetUnit = document.getElementById("dic-target-unit");
+    const targetHint = document.getElementById("dic-target-hint");
+    // Each tab carries its OWN target, so the row shows on both and swaps the
+    // number with the tab — but not when the tab can't run on this site.
     if (targetRow) targetRow.style.display = tabRunnable ? "" : "none";
+    if (targetControl) targetControl.classList.toggle("is-disabled", Boolean(state.running));
+    if (targetUnit) targetUnit.textContent = tab === "creators" ? "creators" : "invites";
+    if (targetHint) {
+      targetHint.textContent =
+        tab === "creators"
+          ? "Stops the sweep at this many creators. Blank collects everything the search gives."
+          : "Stops the scan at this many invites. Blank collects everything the scan finds.";
+    }
     if (targetInput) {
       targetInput.disabled = state.running;
       if (document.activeElement !== targetInput) {
-        const target = getTargetCount();
+        const target = getTargetCount(tab);
         targetInput.value = target > 0 ? String(target) : "";
+      }
+    }
+    for (const id of ["dic-target-down", "dic-target-up"]) {
+      const button = document.getElementById(id);
+      if (button) {
+        button.disabled = state.running || (id === "dic-target-down" && getTargetCount(tab) === 0);
       }
     }
     if (creatorInput && document.activeElement !== creatorInput) {
@@ -3167,7 +3310,7 @@
 
     const startLabel =
       tab === "creators"
-        ? "Start YouTube sweep"
+        ? `Start ${platform.label} sweep`
         : mode === "discover"
           ? "Start Discover"
           : mode === "reader"
@@ -3333,7 +3476,7 @@
       // Target reached: raise the same flag the Stop button sets, so every server
       // flow (sidebar walk, Discover loop, reader scroll) unwinds through the
       // stop path it already has instead of each needing its own check.
-      const target = getTargetCount();
+      const target = getTargetCount("servers");
       if (target > 0 && state.inviteUrls.length >= target && !stopRequested) {
         stopRequested = true;
         log(`Target of ${target} invite(s) reached - stopping.`);
@@ -3529,14 +3672,15 @@
         }
         #dic-target-row,
         #dic-creator-row,
+        #dic-creator-source-row,
         #dic-mode-row,
-        #dic-creator-row,
         #dic-discover-row,
         #dic-discover-language-row {
           margin-bottom: 10px;
         }
         #dic-target-label,
         #dic-creator-label,
+        #dic-creator-source-label,
         #dic-mode-label,
         #dic-discover-label,
         #dic-discover-language-label {
@@ -3547,7 +3691,9 @@
           margin-bottom: 5px;
         }
         #dic-mode,
+        #dic-creator-source,
         #dic-discover-language,
+        #dic-creator-query,
         #dic-discover-query {
           width: 100%;
           border: 1px solid var(--dic-input);
@@ -3561,12 +3707,105 @@
           transition: border-color .15s ease, box-shadow .15s ease;
         }
         #dic-mode:focus,
+        #dic-creator-source:focus,
         #dic-discover-language:focus,
+        #dic-creator-query:focus,
         #dic-discover-query:focus {
           border-color: var(--dic-ring);
           box-shadow: 0 0 0 3px color-mix(in oklab, var(--dic-ring) 25%, transparent);
         }
+        #dic-creator-source:disabled,
+        #dic-creator-query:disabled {
+          opacity: .5;
+          cursor: default;
+        }
+        #dic-creator-query::placeholder,
         #dic-discover-query::placeholder {
+          color: var(--dic-muted-foreground);
+        }
+        /* Target is a composed control, not a bare input: the native number
+           spinner renders as a light-themed widget the panel's palette cannot
+           reach, so the value, its unit and a pair of steppers share one framed
+           row and the input itself is a plain text field. */
+        #dic-target-control {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          padding: 4px 4px 4px 10px;
+          border: 1px solid var(--dic-input);
+          border-radius: var(--dic-radius-sm);
+          background: var(--dic-card);
+          transition: border-color .15s ease, box-shadow .15s ease, opacity .15s ease;
+        }
+        #dic-target-control:focus-within {
+          border-color: var(--dic-ring);
+          box-shadow: 0 0 0 3px color-mix(in oklab, var(--dic-ring) 25%, transparent);
+        }
+        #dic-target-control.is-disabled {
+          opacity: .5;
+        }
+        #dic-target {
+          flex: 1 1 auto;
+          min-width: 0;
+          border: 0;
+          background: transparent;
+          color: var(--dic-foreground);
+          font-family: inherit;
+          font-size: 13px;
+          font-weight: 600;
+          font-variant-numeric: tabular-nums;
+          padding: 4px 0;
+          outline: none;
+        }
+        #dic-target::placeholder {
+          color: var(--dic-muted-foreground);
+          font-size: 12px;
+          font-weight: 500;
+        }
+        #dic-target-unit {
+          flex: 0 0 auto;
+          font-size: 11px;
+          color: var(--dic-muted-foreground);
+          white-space: nowrap;
+        }
+        #dic-target-steps {
+          flex: 0 0 auto;
+          display: inline-flex;
+          gap: 2px;
+        }
+        .dic-target-step {
+          width: 24px;
+          height: 24px;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          border: 1px solid var(--dic-border);
+          border-radius: 7px;
+          background: var(--dic-secondary);
+          color: var(--dic-muted-foreground);
+          font-family: inherit;
+          font-size: 13px;
+          font-weight: 600;
+          line-height: 1;
+          cursor: pointer;
+          transition: filter .15s ease, color .15s ease;
+        }
+        .dic-target-step:hover:not(:disabled) {
+          filter: brightness(1.2);
+          color: var(--dic-foreground);
+        }
+        .dic-target-step:focus-visible {
+          outline: none;
+          box-shadow: 0 0 0 3px color-mix(in oklab, var(--dic-ring) 35%, transparent);
+        }
+        .dic-target-step:disabled {
+          opacity: .4;
+          cursor: default;
+        }
+        #dic-target-hint {
+          margin-top: 5px;
+          font-size: 10px;
+          line-height: 1.4;
           color: var(--dic-muted-foreground);
         }
         #dic-actions {
@@ -3805,10 +4044,22 @@
         <div id="dic-site-hint" style="display:none"></div>
         <div id="dic-target-row">
           <label id="dic-target-label" for="dic-target">Target</label>
-          <input id="dic-target" type="number" min="0" step="1" placeholder="0 = no limit" autocomplete="off" />
+          <div id="dic-target-control">
+            <input id="dic-target" type="text" inputmode="numeric" pattern="[0-9]*" placeholder="No limit" autocomplete="off" spellcheck="false" />
+            <span id="dic-target-unit"></span>
+            <span id="dic-target-steps">
+              <button type="button" class="dic-target-step" id="dic-target-down" aria-label="Lower target" title="Lower target">&#8722;</button>
+              <button type="button" class="dic-target-step" id="dic-target-up" aria-label="Raise target" title="Raise target">&#43;</button>
+            </span>
+          </div>
+          <div id="dic-target-hint"></div>
+        </div>
+        <div id="dic-creator-source-row" style="display:none">
+          <label id="dic-creator-source-label" for="dic-creator-source">Source</label>
+          <select id="dic-creator-source"></select>
         </div>
         <div id="dic-creator-row" style="display:none">
-          <label id="dic-creator-label" for="dic-creator-query">YouTube</label>
+          <label id="dic-creator-label" for="dic-creator-query">Search</label>
           <input id="dic-creator-query" type="text" placeholder="ex: roblox blox fruits" autocomplete="off" spellcheck="false" />
         </div>
         <div id="dic-mode-row">
@@ -3917,6 +4168,23 @@
     });
     const targetInput = panel.querySelector("#dic-target");
     targetInput.oninput = () => setTargetCount(targetInput.value);
+    targetInput.onkeydown = (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        startCollection();
+        return;
+      }
+      // The field is a text input (no native spinner to inherit), so the arrow
+      // keys a number input would have handled are wired to the same step.
+      if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+        e.preventDefault();
+        stepTarget(e.key === "ArrowUp" ? TARGET_STEP : -TARGET_STEP);
+      }
+    };
+    panel.querySelector("#dic-target-up").onclick = () => stepTarget(TARGET_STEP);
+    panel.querySelector("#dic-target-down").onclick = () => stepTarget(-TARGET_STEP);
+    const creatorSourceSelect = panel.querySelector("#dic-creator-source");
+    creatorSourceSelect.onchange = () => setCreatorPlatform(creatorSourceSelect.value);
     const creatorInput = panel.querySelector("#dic-creator-query");
     creatorInput.oninput = () => setCreatorQuery(creatorInput.value);
     creatorInput.onkeydown = (e) => {
@@ -4151,15 +4419,16 @@
       // none of the Discord flow state (no modes, no Discover watchdog, no
       // navigation), so they branch out before any of that is touched.
       if (getActiveTab() === "creators") {
+        const platform = getCreatorPlatform();
         const query = getCreatorQuery();
         if (!query) {
-          setStatus("Type a YouTube search term first.");
+          setStatus(`Type a ${platform.label} search term first.`);
           return;
         }
         const creatorState = loadState();
         creatorState.running = true;
         creatorState.log = "";
-        creatorState.statusText = "YouTube sweep running...";
+        creatorState.statusText = `${platform.label} sweep running...`;
         saveState(creatorState);
         refreshUI();
         try {
@@ -4171,7 +4440,7 @@
         const doneState = loadState();
         doneState.running = false;
         const total = (doneState.creators || []).length;
-        const creatorTarget = getTargetCount();
+        const creatorTarget = getTargetCount("creators");
         doneState.statusText =
           creatorTarget > 0 && total >= creatorTarget
             ? `Target reached. ${total} creator(s) collected.`
@@ -4243,7 +4512,7 @@
       finalState.discoverLastBrowseAt = 0;
       stopDiscoverWatchdog();
 
-      const inviteTarget = getTargetCount();
+      const inviteTarget = getTargetCount("servers");
       const hitTarget = inviteTarget > 0 && finalState.inviteUrls.length >= inviteTarget;
       if (hitTarget) {
         finalState.statusText = `Target reached. ${formatCollectionSummary(finalState.inviteUrls.length)}`;

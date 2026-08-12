@@ -29,9 +29,18 @@ The panel opens on the tab the current site can actually run: Discord shows **Se
 **Creators**. Selecting the other tab tells you where to go rather than offering controls that cannot
 work — server collection drives the Discord DOM, creator collection reads YouTube's own data.
 
-## Creators (YouTube)
+## Target
 
-Type a search term (e.g. `roblox blox fruits`) and press Start. The sweep reads YouTube's
+Both tabs carry their own **Target** — the count the run stops at. Servers counts invites, Creators
+counts creator records, and each tab remembers its own number, so a 100-creator sweep does not also
+cap the next server scan. Leave it blank to collect everything the source gives; the `−`/`+` steppers
+(and the arrow keys) move it in tens.
+
+## Creators
+
+**Source** picks the platform to sweep. YouTube is the only one with a collector today; the rest are
+listed as *soon* and cannot be selected. Type a search term (e.g. `roblox blox fruits`) and press
+Start. The sweep reads YouTube's
 channel-filtered search results, then opens each channel's About data for its stats and profile links.
 **Copy** puts the batch on your clipboard as JSONL — one complete JSON record per line — which is what
 **SpokPayCRM → Creators → Import** expects. You paste it there yourself; nothing is imported
