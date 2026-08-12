@@ -91,40 +91,113 @@
   // ===========================================================================
   const SITE = /(^|\.)youtube\.com$/i.test(location.hostname) ? "youtube" : "discord";
 
-  // Run one creator sweep: channel-filtered search, paginated, then one About
-  // read per new channel. Appends complete records to `state.creators`.
-  async function collectCreators(query) {
-    const capturedAt = new Date().toISOString();
-    const known = new Set((loadState().creators || []).map((row) => row.platform_id));
-    let discovered = [];
+  // Fetch an unfiltered (video) search page, used as the second discovery source.
+  async function ytFetchVideoSearch(query) {
+    const url = `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`;
+    const res = await fetch(url, { credentials: "include" });
+    if (!res.ok) throw new Error(`video search HTTP ${res.status}`);
+    const data = ytExtractInitialData(await res.text());
+    if (!data) throw new Error("could not read YouTube search data");
+    return data;
+  }
+
+  // Page through one search source, collecting channels until it runs dry, the
+  // target is met, or the operator stops. Returns everything new it found.
+  //
+  // `extract` is what makes a source: the channel filter reads `channelRenderer`,
+  // video search reads each result's uploader. Everything else — the
+  // continuation walk, the dry-page tolerance, the stop conditions — is shared.
+  async function ytPageThrough(label, firstPage, extract, known, wanted) {
+    const found = [];
+    let data = firstPage;
     let dryPages = 0;
 
-    log(`Searching YouTube channels for "${query}"...`);
-    let data = await ytFetchSearch(query);
-
-    for (let page = 0; page < YT_MAX_PAGES; page += 1) {
+    for (let page = 1; page <= YT_MAX_PAGES; page += 1) {
       if (stopRequested) break;
-      const batch = ytChannelsFromSearch(data).filter((entry) => !known.has(entry.channelId));
+
+      const batch = extract(data).filter((entry) => !known.has(entry.channelId));
       batch.forEach((entry) => known.add(entry.channelId));
-      discovered = discovered.concat(batch);
+      found.push(...batch);
 
       if (batch.length === 0) {
         dryPages += 1;
+        // Do NOT stop on the first empty pages: YouTube pads these lists with
+        // Shorts and resumes handing out channels several pages later.
         if (dryPages >= YT_DRY_PAGE_LIMIT) {
-          log(`No new channels for ${dryPages} pages - stopping.`);
+          log(`${label}: no new channels for ${dryPages} pages - source exhausted.`);
           break;
         }
       } else {
         dryPages = 0;
-        log(`Page ${page + 1}: ${batch.length} new channel(s).`);
+        log(`${label} page ${page}: ${batch.length} new channel(s). ${found.length} queued.`);
+      }
+
+      // Enough discovered to satisfy the target; stop paging and go enrich.
+      if (wanted > 0 && found.length >= wanted) {
+        log(`${label}: enough channels for the target.`);
+        break;
       }
 
       const command = ytFind(data, "continuationCommand");
       const token = command && command.token;
-      if (!token) break;
+      if (!token) {
+        log(`${label}: no further pages.`);
+        break;
+      }
       const next = await ytFetchContinuation(token);
-      if (!next) break;
+      if (!next) {
+        log(`${label}: continuation unavailable.`);
+        break;
+      }
       data = next;
+      await sleep(YT_PAGE_DELAY_MS);
+    }
+
+    return found;
+  }
+
+  // Run one creator sweep. Discovers from BOTH search sources, then reads each
+  // new channel's About page. Runs until the target is met, both sources are
+  // exhausted, or the operator stops.
+  async function collectCreators(query) {
+    const capturedAt = new Date().toISOString();
+    const known = new Set((loadState().creators || []).map((row) => row.platform_id));
+    const target = getTargetCount();
+    // Over-discover a little: some channels fail their About fetch, and coming up
+    // short of the target because of that would be worse than a few extra reads.
+    const wanted = target > 0 ? Math.max(target - currentCollectedCount(), 0) + 5 : 0;
+
+    log(
+      target > 0
+        ? `Sweeping YouTube for "${query}" - target ${target} creator(s).`
+        : `Sweeping YouTube for "${query}" - no target, collecting everything.`,
+    );
+
+    let discovered = [];
+
+    // Source 1: the channel filter. Highest-quality hits (real channel records
+    // with subscriber counts), so it goes first.
+    try {
+      const channelPage = await ytFetchSearch(query);
+      discovered = discovered.concat(
+        await ytPageThrough("Channels", channelPage, ytChannelsFromSearch, known, wanted),
+      );
+    } catch (err) {
+      log(`Channel search failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    // Source 2: video search uploaders. Only if there is still appetite — this is
+    // the deeper vein and is what carries a sweep past the channel filter's end.
+    const stillWanted = wanted > 0 ? wanted - discovered.length : 0;
+    if (!stopRequested && (wanted === 0 || stillWanted > 0)) {
+      try {
+        const videoPage = await ytFetchVideoSearch(query);
+        discovered = discovered.concat(
+          await ytPageThrough("Videos", videoPage, ytUploadersFromSearch, known, stillWanted),
+        );
+      } catch (err) {
+        log(`Video search failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
     }
 
     if (discovered.length === 0) {
@@ -135,6 +208,10 @@
     log(`Reading ${discovered.length} channel page(s) for links and stats...`);
     for (const entry of discovered) {
       if (stopRequested) break;
+      if (targetReached()) {
+        log(`Target of ${getTargetCount()} reached.`);
+        break;
+      }
       try {
         const detail = await ytEnrichChannel(entry.channelId);
         const record = {
@@ -185,9 +262,25 @@
   // documented "Channel" value, so the sweep reads channel records directly
   // instead of inferring uploaders from video results.
   const YT_CHANNEL_FILTER = "EgIQAg%3D%3D";
-  const YT_MAX_PAGES = 5;
-  const YT_DRY_PAGE_LIMIT = 2;
+
+  // Safety stop only. There is no page budget any more: YouTube hands out
+  // continuation tokens well past the point it stops returning channels, so a
+  // low cap silently truncated every sweep. This exists purely so a bug can't
+  // spin forever.
+  const YT_MAX_PAGES = 200;
+
+  // Consecutive pages with NOTHING new before giving up.
+  //
+  // This was 2, and it was the reason a "blox fruits" sweep stopped at ~40 while
+  // the site clearly had more. Measured against live search: pages 3, 4 and 5 of
+  // the channel filter return ZERO channels — they are padded with Shorts
+  // (`shortsLockupViewModel`) — and then page 6 produces one again. Video search
+  // does the same: two dry pages, then seven new channels on the next. Two empty
+  // pages is normal mid-list, not the end of the list.
+  const YT_DRY_PAGE_LIMIT = 10;
+
   const YT_ENRICH_DELAY_MS = 350;
+  const YT_PAGE_DELAY_MS = 250;
 
   // Depth-first search for the first object carrying `key`. Used instead of
   // fixed paths into `ytInitialData`: YouTube reshuffles renderer nesting often,
@@ -423,6 +516,53 @@
     return out;
   }
 
+  // Harvest channels from a VIDEO search payload, via each result's uploader.
+  //
+  // The channel filter alone is a shallow vein: measured on "blox fruits" it
+  // yields ~41 channels and then genuinely runs out. Video search surfaces a
+  // different and larger set — the creators actually publishing about the term,
+  // many of whom the channel filter never lists — so the sweep uses both and
+  // dedupes across them by channel id. This is what lets a sweep reach a target
+  // instead of stalling at whatever one source happens to hold.
+  //
+  // Uploaders arrive with only an id and a name; every other field is filled in
+  // by the About fetch, exactly as for channel-filter hits.
+  function ytUploadersFromSearch(data) {
+    const out = [];
+    const push = (channelId, name, canonical) => {
+      if (typeof channelId !== "string" || !channelId.startsWith("UC")) return;
+      if (out.some((entry) => entry.channelId === channelId)) return;
+      out.push({
+        channelId,
+        name: name || "",
+        handle: canonical ? (canonical.match(/@[\w.-]+/) || [null])[0] : null,
+        profileUrl: canonical
+          ? `https://www.youtube.com${canonical}`
+          : `https://www.youtube.com/channel/${channelId}`,
+        avatarUrl: null,
+        subscribers: null,
+        description: "",
+      });
+    };
+
+    for (const video of ytCollect(data, "videoRenderer")) {
+      const run =
+        (video.ownerText && video.ownerText.runs && video.ownerText.runs[0]) ||
+        (video.longBylineText && video.longBylineText.runs && video.longBylineText.runs[0]);
+      const browse =
+        run && run.navigationEndpoint && run.navigationEndpoint.browseEndpoint;
+      push(browse && browse.browseId, run && run.text, browse && browse.canonicalBaseUrl);
+    }
+
+    // Shorts are a large share of Roblox-adjacent search results and carry their
+    // channel too, so skipping them would discard real creators.
+    for (const short of ytCollect(data, "shortsLockupViewModel")) {
+      push(ytFind(short, "browseId"), "", null);
+    }
+
+    return out;
+  }
+
   // Fetch one channel's About data — where the profile links live, i.e. the
   // Instagram / TikTok / Discord the operator actually needs to reach out.
   async function ytEnrichChannel(channelId) {
@@ -606,6 +746,9 @@
       activeTab: SITE === "youtube" ? "creators" : "servers",
       creatorQuery: "",
       creators: [],
+      // Stop-at count for the ACTIVE tab's collection. 0 / blank means "collect
+      // everything the source will give", which is the old behaviour.
+      targetCount: 0,
       currentServer: null,
       log: "",
       statusText: "",
@@ -628,6 +771,35 @@
     state.activeTab = tab === "creators" ? "creators" : "servers";
     saveState(state);
     refreshUI();
+  }
+
+  // Target for the active tab: how many leads to stop at. 0 = no target.
+  function getTargetCount() {
+    const raw = Number(loadState().targetCount);
+    return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 0;
+  }
+
+  function setTargetCount(value) {
+    const state = loadState();
+    const parsed = Number(String(value).replace(/[^\d]/g, ""));
+    state.targetCount = Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 0;
+    saveState(state);
+    refreshUI();
+  }
+
+  // How many the active tab has collected so far — the number a target is
+  // measured against.
+  function currentCollectedCount() {
+    const state = loadState();
+    return getActiveTab() === "creators"
+      ? (state.creators || []).length
+      : (state.inviteUrls || []).length;
+  }
+
+  // True once a target exists and has been met. Checked by both collectors.
+  function targetReached() {
+    const target = getTargetCount();
+    return target > 0 && currentCollectedCount() >= target;
   }
 
   function getCreatorQuery() {
@@ -2977,6 +3149,18 @@
           : "Open discord.com to collect server invites.";
     }
     if (creatorRow) creatorRow.style.display = tab === "creators" && tabRunnable ? "" : "none";
+    const targetRow = document.getElementById("dic-target-row");
+    const targetInput = document.getElementById("dic-target");
+    // The target applies to whichever tab is collecting, so it shows on both —
+    // but not when the tab can't run on this site.
+    if (targetRow) targetRow.style.display = tabRunnable ? "" : "none";
+    if (targetInput) {
+      targetInput.disabled = state.running;
+      if (document.activeElement !== targetInput) {
+        const target = getTargetCount();
+        targetInput.value = target > 0 ? String(target) : "";
+      }
+    }
     if (creatorInput && document.activeElement !== creatorInput) {
       creatorInput.value = state.creatorQuery || "";
     }
@@ -3145,6 +3329,15 @@
         markDiscoverProgress();
       }
       refreshUI();
+
+      // Target reached: raise the same flag the Stop button sets, so every server
+      // flow (sidebar walk, Discover loop, reader scroll) unwinds through the
+      // stop path it already has instead of each needing its own check.
+      const target = getTargetCount();
+      if (target > 0 && state.inviteUrls.length >= target && !stopRequested) {
+        stopRequested = true;
+        log(`Target of ${target} invite(s) reached - stopping.`);
+      }
     }
 
     return { added, skippedInvalid };
@@ -3334,6 +3527,7 @@
           font-size: 11px;
           line-height: 1.45;
         }
+        #dic-target-row,
         #dic-creator-row,
         #dic-mode-row,
         #dic-creator-row,
@@ -3341,6 +3535,7 @@
         #dic-discover-language-row {
           margin-bottom: 10px;
         }
+        #dic-target-label,
         #dic-creator-label,
         #dic-mode-label,
         #dic-discover-label,
@@ -3608,6 +3803,10 @@
           </button>
         </div>
         <div id="dic-site-hint" style="display:none"></div>
+        <div id="dic-target-row">
+          <label id="dic-target-label" for="dic-target">Target</label>
+          <input id="dic-target" type="number" min="0" step="1" placeholder="0 = no limit" autocomplete="off" />
+        </div>
         <div id="dic-creator-row" style="display:none">
           <label id="dic-creator-label" for="dic-creator-query">YouTube</label>
           <input id="dic-creator-query" type="text" placeholder="ex: roblox blox fruits" autocomplete="off" spellcheck="false" />
@@ -3716,6 +3915,8 @@
     panel.querySelectorAll(".dic-tab").forEach((button) => {
       button.onclick = () => setActiveTab(button.dataset.tab);
     });
+    const targetInput = panel.querySelector("#dic-target");
+    targetInput.oninput = () => setTargetCount(targetInput.value);
     const creatorInput = panel.querySelector("#dic-creator-query");
     creatorInput.oninput = () => setCreatorQuery(creatorInput.value);
     creatorInput.onkeydown = (e) => {
@@ -3970,9 +4171,13 @@
         const doneState = loadState();
         doneState.running = false;
         const total = (doneState.creators || []).length;
-        doneState.statusText = stopRequested
-          ? `Stopped. ${total} creator(s) collected.`
-          : `Finished. ${total} creator(s) collected.`;
+        const creatorTarget = getTargetCount();
+        doneState.statusText =
+          creatorTarget > 0 && total >= creatorTarget
+            ? `Target reached. ${total} creator(s) collected.`
+            : stopRequested
+              ? `Stopped. ${total} creator(s) collected.`
+              : `Finished. ${total} creator(s) collected.`;
         saveState(doneState);
         refreshUI();
         return;
@@ -4038,7 +4243,11 @@
       finalState.discoverLastBrowseAt = 0;
       stopDiscoverWatchdog();
 
-      if (stopRequested) {
+      const inviteTarget = getTargetCount();
+      const hitTarget = inviteTarget > 0 && finalState.inviteUrls.length >= inviteTarget;
+      if (hitTarget) {
+        finalState.statusText = `Target reached. ${formatCollectionSummary(finalState.inviteUrls.length)}`;
+      } else if (stopRequested) {
         finalState.statusText = `Stopped. ${formatCollectionSummary(finalState.inviteUrls.length)}`;
       } else {
         finalState.statusText = `Finished. ${formatCollectionSummary(finalState.inviteUrls.length)}`;
