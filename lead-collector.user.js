@@ -125,7 +125,15 @@
     (entry) => `${entry.value}${entry.available ? "" : "!"}`,
   ).join("|");
 
-  // Timestamp of a channel's newest upload, from its Atom feed.
+  // A channel's newest uploads, from its Atom feed: the timestamp the freshness
+  // gate judges on, plus the top few entries the CRM shows as a "Most Recent"
+  // podium on the creator's profile.
+  //
+  // Those two used to be one number — the gate read the newest <published> and
+  // threw the rest of the document away. Keeping the entries costs NOTHING: the
+  // feed is already fetched, already parsed, and already carries every field the
+  // podium needs (title, URL, thumbnail, view count). Shorts and long-form both
+  // appear here, in one newest-first list.
   //
   // The feed is the only cheap source of an ABSOLUTE date. The /videos tab
   // carries `publishedTimeText` ("3 days ago", "há 3 dias") — localized to the
@@ -139,10 +147,34 @@
   // Read with a regex, like ytInitialData, rather than DOMParser — same reason,
   // and it keeps the Trusted Types question from arising at all.
   //
-  // Returns the newest entry's time in ms, or null when the feed holds no
-  // entries (a channel that has never uploaded, or hides its uploads). Throws
-  // when the feed itself cannot be read — 404 for a channel that is gone.
-  async function ytFetchLatestUpload(channelId) {
+  // Returns `{ newest, videos }` — the newest entry's time in ms (null when the
+  // feed holds no entries at all: a channel that has never uploaded, or hides
+  // its uploads) and the top `YT_RECENT_VIDEO_LIMIT` entries, newest first.
+  // Throws when the feed itself cannot be read — 404 for a channel that is gone.
+
+  // How many uploads travel with a record. Three, because that is what the CRM
+  // profile's podium shows; the feed itself carries ~15.
+  const YT_RECENT_VIDEO_LIMIT = 3;
+
+  // The five entities XML guarantees, plus numeric escapes. Video titles are the
+  // only free text taken from the feed and routinely carry `&amp;` and `&#39;`,
+  // which would otherwise reach the CRM literally.
+  const XML_ENTITIES = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'" };
+
+  function decodeXmlText(raw) {
+    return raw.replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z]+);/g, (match, entity) => {
+      if (entity.startsWith("#")) {
+        const code =
+          entity[1] === "x" || entity[1] === "X"
+            ? Number.parseInt(entity.slice(2), 16)
+            : Number.parseInt(entity.slice(1), 10);
+        return Number.isFinite(code) && code > 0 ? String.fromCodePoint(code) : match;
+      }
+      return XML_ENTITIES[entity] || match;
+    });
+  }
+
+  async function ytFetchRecentUploads(channelId) {
     const res = await fetch(
       `https://www.youtube.com/feeds/videos.xml?channel_id=${encodeURIComponent(channelId)}`,
       { credentials: "include" },
@@ -153,15 +185,52 @@
     // Only entry bodies are considered. The document's FIRST <published> belongs
     // to the feed itself and is the channel's creation date, so reading dates
     // document-wide would judge every channel by the day it was made. Entries
-    // are newest-first in practice; taking the max does not rely on that.
+    // are newest-first in practice; sorting below does not rely on that.
     let newest = 0;
+    const videos = [];
+
     for (const chunk of xml.split("<entry>").slice(1)) {
-      const match = chunk.match(/<published>([^<]+)<\/published>/);
-      const time = match ? Date.parse(match[1]) : NaN;
+      const published = chunk.match(/<published>([^<]+)<\/published>/);
+      const time = published ? Date.parse(published[1]) : NaN;
       if (Number.isFinite(time) && time > newest) newest = time;
+
+      const videoId = chunk.match(/<yt:videoId>([^<]+)<\/yt:videoId>/);
+      if (!videoId) continue;
+
+      // The entry's own <title> precedes <media:group>, so the first match is the
+      // video title and not the <media:title> duplicate inside the group.
+      const title = chunk.match(/<title>([\s\S]*?)<\/title>/);
+      const href = chunk.match(/<link[^>]+rel="alternate"[^>]+href="([^"]+)"/);
+      const thumbnail = chunk.match(/<media:thumbnail[^>]+url="([^"]+)"/);
+      const views = chunk.match(/<media:statistics[^>]+views="(\d+)"/);
+      const url = href
+        ? decodeXmlText(href[1])
+        : `https://www.youtube.com/watch?v=${videoId[1]}`;
+
+      videos.push({
+        video_id: videoId[1],
+        title: title ? decodeXmlText(title[1]).trim() || null : null,
+        // Kept as the feed gave it: rebuilding from the id would lose the
+        // /shorts/ form, which is both the right destination and how a Short is
+        // told apart from a video.
+        url,
+        thumbnail_url: thumbnail ? thumbnail[1] : null,
+        published_at: published ? published[1] : null,
+        view_count: views ? Number.parseInt(views[1], 10) : null,
+        is_short: url.includes("/shorts/"),
+      });
     }
 
-    return newest > 0 ? newest : null;
+    videos.sort((a, b) => {
+      const left = a.published_at ? Date.parse(a.published_at) : 0;
+      const right = b.published_at ? Date.parse(b.published_at) : 0;
+      return right - left;
+    });
+
+    return {
+      newest: newest > 0 ? newest : null,
+      videos: videos.slice(0, YT_RECENT_VIDEO_LIMIT),
+    };
   }
 
   function daysSince(timestamp) {
@@ -358,11 +427,20 @@
       // whole point is that nothing unverified gets through, and the log says
       // which of the two it was. Skipped entirely on "Any time", which also
       // spares every channel the extra request.
+      //
+      // The same read also supplies the record's `recent_videos`. On "Any time"
+      // the feed is not fetched at all, so those sweeps import creators without
+      // uploads — the CRM fills the podium in from its own side on first view,
+      // which is why this stays a free by-product of the gate rather than a
+      // request every sweep now has to pay for.
       let uploadAgeDays = null;
+      let recentVideos = [];
       if (gapDays > 0) {
         let latestUpload;
         try {
-          latestUpload = await ytFetchLatestUpload(entry.channelId);
+          const feed = await ytFetchRecentUploads(entry.channelId);
+          latestUpload = feed.newest;
+          recentVideos = feed.videos;
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           stats.dropped += 1;
@@ -407,6 +485,10 @@
           country: detail.country,
           discovered_via: query,
           captured_at: capturedAt,
+          // Omitted, not empty, when this sweep never read the feed: the CRM
+          // treats an empty array as "this channel has no uploads" and would
+          // cache that instead of looking for itself.
+          ...(recentVideos.length ? { recent_videos: recentVideos } : {}),
         };
         const state = loadState();
         state.creators = (state.creators || []).concat([record]);
@@ -547,7 +629,8 @@
   // Freshness gate: a channel whose newest upload is older than the chosen
   // window is dropped before it is ever enriched. An abandoned channel is not a
   // lead, and the check is cheap enough to run on everything (see
-  // ytFetchLatestUpload). 0 turns the gate off entirely.
+  // ytFetchRecentUploads). 0 turns the gate off entirely — which also means no
+  // feed read, so those sweeps carry no `recent_videos` either.
   const YT_UPLOAD_GAP_CHOICES = [
     { value: 7, label: "Last 7 days" },
     { value: 14, label: "Last 14 days" },
