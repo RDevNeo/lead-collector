@@ -998,6 +998,8 @@
   let discoverLanguageFailures = 0;
   let discoverLanguageEnforcementOff = false;
   let memberListToggleLabel = "";
+  // In-memory cache of the stored label — read through getInviteButtonLabel, which seeds it
+  // from the saved state after the reload between Discover servers.
   let inviteButtonLabel = "";
 
   const ICONS = {
@@ -1113,6 +1115,10 @@
       discoverLastBrowseAt: 0,
       serverIndex: 0,
       inviteUrls: [],
+      // What the control that opened an invite dialog was labelled, learned from the
+      // first server that answered. Stored rather than kept in memory because Discover
+      // reloads the page between servers, which would throw the lesson away every time.
+      inviteButtonLabel: "",
       // Creator tab state. Kept alongside the invite state rather than in a
       // second store so one Clear/Copy/log surface serves both tabs.
       activeTab: SITE === "youtube" ? "creators" : "servers",
@@ -2585,6 +2591,30 @@
     return false;
   }
 
+  function getInviteButtonLabel() {
+    if (!inviteButtonLabel) inviteButtonLabel = String(loadState().inviteButtonLabel || "");
+    return inviteButtonLabel;
+  }
+
+  function rememberInviteButtonLabel(label) {
+    const next = normalizeInlineText(label || "");
+    if (!next || next === getInviteButtonLabel()) return;
+    inviteButtonLabel = next;
+    const state = loadState();
+    state.inviteButtonLabel = next;
+    saveState(state);
+  }
+
+  // A server this account is not allowed to create invites for. Not a failure of the scan:
+  // the only move is to leave it and take the next Discover result, so it travels as a
+  // flagged error rather than something the caller has to recognize by its message.
+  function inviteNotAvailableError(reason, serverName) {
+    const err = new Error(reason);
+    err.inviteNotAvailable = true;
+    err.serverName = String(serverName || "");
+    return err;
+  }
+
   // "Invite" in the languages Discord ships, plus the shared Latin stems. Used only to
   // rank candidates: a client in a language missing here still works, because the button
   // is confirmed by whether clicking it opens a dialog containing an invite link.
@@ -2614,6 +2644,7 @@
     const roots = [getServerNav(), document.querySelector("header"), document.body].filter(Boolean);
     const seen = new Set();
     const scored = [];
+    const knownLabel = getInviteButtonLabel();
 
     for (const root of roots) {
       for (const element of root.querySelectorAll("button, [role='button'], [aria-haspopup='dialog'], [aria-haspopup='menu']")) {
@@ -2642,7 +2673,7 @@
         // mistake here costs a wasted click at the end of the queue, not a missed server.
         if (INVITE_LABEL_EXCLUSION_PATTERN.test(label)) score -= 300;
         // Whatever opened the dialog last time is almost certainly it again.
-        if (inviteButtonLabel && label && label === inviteButtonLabel) score += 400;
+        if (label && label === knownLabel) score += 400;
         if (element.getAttribute("aria-haspopup") === "dialog") score += 60;
         if (element.querySelector("svg")) score += 20;
         if (!label) score += 10;
@@ -2655,6 +2686,23 @@
     return scored
       .sort((a, b) => b.score - a.score || a.element.getBoundingClientRect().top - b.element.getBoundingClientRect().top)
       .slice(0, 8);
+  }
+
+  // Whether the header holds anything that could open an invite dialog. Discord does not
+  // grey the invite control out on a server the account may not invite to — it renders none
+  // at all — so a header whose controls are all labelled, and none of them invite-shaped, is
+  // a permission answer rather than a slow page. An unlabelled control always counts: an
+  // icon button whose label has not rendered yet cannot be ruled out, and answering "maybe"
+  // there only costs the probe that used to run unconditionally.
+  function offersInviteControl(candidates) {
+    if (!candidates || candidates.length === 0) return false;
+
+    const known = getInviteButtonLabel();
+    return candidates.some((candidate) => {
+      if (!candidate.label) return true;
+      if (INVITE_LABEL_PATTERN.test(candidate.label)) return true;
+      return Boolean(known) && candidate.label === known;
+    });
   }
 
   async function extractInviteFromDialog(dialog) {
@@ -2767,6 +2815,24 @@
       throw new Error("Could not find any invite button candidates in the server header.");
     }
 
+    // Only the server page can answer this: on Discover's own page — which is what is still
+    // rendered if the card never opened — the absent invite control means nothing. The
+    // channel sidebar is the structural proof that a server is open.
+    if (getServerNav() && !offersInviteControl(candidates)) {
+      // A control that has not rendered yet looks exactly like one that never will, so
+      // the header gets a second look before the server is written off.
+      await revealServerHeaderActions(resolvedServerName);
+      await sleep(900);
+      const recheck = getInviteButtonCandidates();
+      if (!offersInviteControl(recheck)) {
+        throw inviteNotAvailableError(
+          "the server header offers no invite control, so this account cannot create invites here",
+          resolvedServerName,
+        );
+      }
+      candidates = recheck;
+    }
+
     let dialog = null;
     for (const candidate of candidates) {
       if (stopRequested) return false;
@@ -2774,14 +2840,19 @@
       dialog = await openInviteDialogVia(candidate);
       if (dialog) {
         // Remember the winner so later servers go straight to it instead of probing.
-        inviteButtonLabel = candidate.label || inviteButtonLabel;
+        rememberInviteButtonLabel(candidate.label);
         break;
       }
     }
 
+    // Every plausible control was clicked and none produced an invite dialog. Servers that
+    // withhold the "Create Invite" permission end here, and the card is already marked
+    // visited, so restarting the flow would re-search Discover only to move past it anyway.
     if (!dialog) {
-      log(`Could not open the invite dialog after trying ${candidates.length} header buttons.`);
-      throw new Error("Could not find the invite dialog.");
+      throw inviteNotAvailableError(
+        `none of the ${candidates.length} header controls opened an invite dialog`,
+        resolvedServerName,
+      );
     }
 
     const invite = await waitFor(() => extractInviteFromDialog(dialog), 5000);
@@ -2792,7 +2863,7 @@
 
     addInviteUrls([invite], sourceLabel, resolvedServerName || getServerNameFromHeader());
 
-    await closeInviteDialogAndReturnBack(sourceLabel, resolvedServerName);
+    await returnToDiscoverPage();
     return true;
   }
 
@@ -2932,6 +3003,21 @@
     try {
       await harvestDiscoverServer(card, query, ordinal);
     } catch (err) {
+      // A server that will not hand out invites is not an error to recover from — it is a
+      // result. Log it, leave it, and walk on to the next card the way a collected server
+      // does, instead of reloading and re-searching Discover for a card already visited.
+      if (err?.inviteNotAvailable) {
+        log(`SKIP ${err.serverName || card.label || "server"}: ${err.message}.`);
+        markDiscoverProgress();
+        try {
+          await returnToDiscoverPage();
+        } catch (returnErr) {
+          logError("Could not return to Discover after skipping a server.", returnErr);
+          requestFlowRestart("Could not return to Discover after skipping a server.");
+        }
+        return false;
+      }
+
       const message = err instanceof Error ? err.message : String(err);
       logError(`Discover capture error: ${message}`, err);
       await closeAllPopups();
@@ -2942,7 +3028,9 @@
     return true;
   }
 
-  async function closeInviteDialogAndReturnBack(sourceLabel, serverName) {
+  // Shared by both endings of a server visit — the invite copied, and the server skipped —
+  // so a skip leaves the page in exactly the state the next card is picked up from.
+  async function returnToDiscoverPage() {
     const query = getDiscoverQuery();
     await closeAllPopups();
     await sleep(300);

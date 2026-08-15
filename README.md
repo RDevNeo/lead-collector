@@ -120,6 +120,13 @@ Two traps that cost real bugs while building it, both verified against live YouT
 Invite URLs are normalized to `https://discord.gg/<code>` and de-duplicated within the session. The log
 pane shows only collected invites and failures.
 
+### Servers that will not hand out an invite
+
+Plenty of Discover results reserve "Create Invite" for their own members, so no invite control is
+rendered for a visitor at all. Discover skips those the moment it can tell — named in the log as
+`SKIP <server>: …` with the reason — and moves straight to the next result, instead of treating the
+missing dialog as a fault and reloading Discover to re-run the search.
+
 ## Auto-update
 
 `@updateURL`/`@downloadURL` point straight at the raw file on `main` — no proxy, no token, no secrets.
